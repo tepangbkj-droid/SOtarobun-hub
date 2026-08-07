@@ -2,10 +2,11 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ========================================================================
-   Di bawah ini dipindah APA ADANYA dari <style> inline di index.html lama
-   (tidak ada perubahan logika/nilai, murni pindah lokasi file).
-   ======================================================================== */
+/* ================================================================
+   CATATAN: file ini adalah hasil pemindahan LANGSUNG dari <style>
+   di index.html lama (animasi splash, cetak thermal, dan pengaman
+   layout responsif) -- tidak ada yang diubah isinya.
+   ================================================================ */
 
     /* ========================================== */
     /* PENGAMAN RESPONSIF GLOBAL (2026-07-22) */
@@ -206,3 +207,4 @@
       to   { transform: translateX(0); }
     }
     .animate-slideInLeft { animation: tarobunSlideInLeft 0.28s cubic-bezier(0.16, 1, 0.3, 1); }
+  
