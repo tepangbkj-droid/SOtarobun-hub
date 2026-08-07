@@ -1,6 +1,20 @@
-import React, { useState, useEffect } from 'react';
-import Icon from './components/Icon.jsx';
+// =====================================================================
+// Tarobun SO Mandiri Hub — App.jsx
+// Diekstrak OTOMATIS dari index.html lama (bukan ditulis ulang manual)
+// supaya seluruh logic bisnis asli (9000+ baris) tetap 100% sama persis.
+// =====================================================================
+import React from 'react';
+import { createIcons, icons as lucideIconSet } from 'lucide';
 
+// Menjaga API window.lucide.createIcons() PERSIS seperti versi CDN lama,
+// supaya SELURUH <i data-lucide="..."> di JSX di bawah ini tetap berfungsi
+// tanpa perlu diubah satu-per-satu (menghindari resiko salah ketik ulang
+// ratusan pemanggilan ikon secara manual).
+if (typeof window !== 'undefined') {
+  window.lucide = { createIcons: (opts) => createIcons({ icons: lucideIconSet, ...opts }) };
+}
+
+const { useState, useEffect } = React;
 
     // ==========================================
     // KONFIGURASI FIREBASE KELOLAAN ANDA
@@ -9,7 +23,7 @@ import Icon from './components/Icon.jsx';
     // ==========================================
     // KONEKSI KE CLOUDFLARE WORKER (pengganti Firebase)
     // ==========================================
-    const WORKER_BASE = import.meta.env.VITE_API_BASE_URL || 'https://tarobun-api.tepangbkj8.workers.dev';
+    const WORKER_BASE = 'https://tarobun-api.tepangbkj8.workers.dev';
 
     // ==========================================
     // SEMUA fetch() ke WORKER_BASE WAJIB lewat __apiFetch (bukan fetch() langsung) supaya
@@ -1343,7 +1357,7 @@ import Icon from './components/Icon.jsx';
           <div className="fixed inset-0 z-[102] bg-black/60 flex items-center justify-center p-4 animate-fadeIn">
             <div className="bg-white rounded-2xl animate-scaleIn max-w-sm w-full p-6 shadow-2xl">
               <div className="w-12 h-12 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center mb-4">
-                <Icon name={step.icon} className="w-6 h-6" />
+                <i data-lucide={step.icon} className="w-6 h-6"></i>
               </div>
               <h3 className="font-bold text-slate-800 text-base mb-1">{step.title}</h3>
               <p className="text-sm text-slate-500 mb-5">{step.desc}</p>
@@ -1390,7 +1404,7 @@ import Icon from './components/Icon.jsx';
             <div className="bg-white rounded-2xl shadow-2xl p-4 border border-purple-100">
               <div className="flex items-center gap-2 mb-2">
                 <div className="w-8 h-8 shrink-0 rounded-lg bg-purple-100 text-purple-700 flex items-center justify-center">
-                  <Icon name={step.icon} className="w-4 h-4" />
+                  <i data-lucide={step.icon} className="w-4 h-4"></i>
                 </div>
                 <h3 className="font-bold text-slate-800 text-sm">{step.title}</h3>
               </div>
@@ -1420,14 +1434,14 @@ import Icon from './components/Icon.jsx';
         <div className="fixed inset-0 z-[110] bg-black/75 flex items-center justify-center p-4 animate-fadeIn">
           <div className="bg-white rounded-2xl animate-scaleIn max-w-sm w-full p-6 shadow-2xl border-t-4 border-rose-600">
             <div className="w-12 h-12 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center mb-4">
-              <Icon name="alert-triangle" className="w-6 h-6" />
+              <i data-lucide="alert-triangle" className="w-6 h-6"></i>
             </div>
             <h3 className="font-bold text-slate-800 text-base mb-1">Jangan Sampai Lupa! ⚠️</h3>
             <p className="text-xs text-slate-500 mb-4">Beberapa hal ini WAJIB dilakukan setiap hari — mohon dibaca sampai selesai:</p>
             <ul className="space-y-2 mb-5 max-h-60 overflow-y-auto pr-1">
               {items.map((item, i) => (
                 <li key={i} className="flex items-start gap-2 text-xs text-slate-700 bg-rose-50 rounded-lg p-2.5">
-                  <Icon name={item.icon} className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <i data-lucide={item.icon} className="w-4 h-4 text-rose-600 shrink-0 mt-0.5"></i>
                   <span>{item.text}</span>
                 </li>
               ))}
@@ -1789,7 +1803,7 @@ import Icon from './components/Icon.jsx';
                     <span>Nama Toko</span>
                     {dirBackgroundSync && (
                       <span className="inline-flex items-center gap-1 text-[10px] font-normal text-slate-400">
-                        <Icon name="loader-2" className="w-3 h-3 animate-spin" />
+                        <i data-lucide="loader-2" className="w-3 h-3 animate-spin"></i>
                         Menyegarkan...
                       </span>
                     )}
@@ -1808,7 +1822,7 @@ import Icon from './components/Icon.jsx';
                     <span className={`truncate ${selectedStoreName ? 'text-slate-800' : 'text-slate-400'}`}>
                       {dirLoading ? 'Memuat daftar toko...' : (selectedStoreName || (storeDirectory.length === 0 ? 'Tidak ada toko terdaftar' : '-- Pilih Toko --'))}
                     </span>
-                    <Icon name="chevron-down" className={`w-4 h-4 text-slate-400 shrink-0 transition-transform ${storeDropdownOpen ? 'rotate-180' : ''}`} />
+                    <i data-lucide="chevron-down" className={`w-4 h-4 text-slate-400 shrink-0 transition-transform ${storeDropdownOpen ? 'rotate-180' : ''}`}></i>
                   </button>
 
                   {storeDropdownOpen && !dirLoading && (
@@ -1816,7 +1830,7 @@ import Icon from './components/Icon.jsx';
                       {storeDirectory.length > 5 && (
                         <div className="p-2 border-b border-slate-100">
                           <div className="relative">
-                            <Icon name="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                            <i data-lucide="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"></i>
                             <input
                               type="text"
                               autoFocus
@@ -1932,7 +1946,7 @@ import Icon from './components/Icon.jsx';
         <div>
           {stores.length > 5 && (
             <div className="relative mb-1.5">
-              <Icon name="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <i data-lucide="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"></i>
               <input
                 type="text"
                 value={query}
@@ -3037,7 +3051,7 @@ import Icon from './components/Icon.jsx';
                   className="p-2 -ml-1 bg-white/10 hover:bg-white/20 rounded-lg text-white border border-white/20 transition-all shrink-0"
                   title="Menu"
                 >
-                  <Icon name="menu" className="w-5 h-5" />
+                  <i data-lucide="menu" className="w-5 h-5"></i>
                 </button>
                 <div className="bg-white text-indigo-900 w-8 h-8 rounded-full font-bold flex items-center justify-center text-md tracking-wider shrink-0">A</div>
                 <div className="min-w-0">
@@ -3048,11 +3062,11 @@ import Icon from './components/Icon.jsx';
               <div className="flex items-center gap-1.5 shrink-0">
                 {notifPermission !== 'granted' && notifPermission !== 'unsupported' && (
                   <button onClick={handleEnableNotif} className="p-2 bg-amber-500 hover:bg-amber-600 rounded-lg text-white transition-all" title="Aktifkan notifikasi browser">
-                    <Icon name="bell" className="w-5 h-5" />
+                    <i data-lucide="bell" className="w-5 h-5"></i>
                   </button>
                 )}
                 <button onClick={onLogout} className="p-2 bg-white/10 hover:bg-rose-600 rounded-lg text-white transition-all" title="Keluar">
-                  <Icon name="log-out" className="w-5 h-5" />
+                  <i data-lucide="log-out" className="w-5 h-5"></i>
                 </button>
               </div>
             </div>
@@ -3077,45 +3091,45 @@ import Icon from './components/Icon.jsx';
                     </div>
                   </div>
                   <button onClick={() => setShowMenu(false)} className="p-1.5 hover:bg-white/10 rounded-lg">
-                    <Icon name="x" className="w-5 h-5" />
+                    <i data-lucide="x" className="w-5 h-5"></i>
                   </button>
                 </div>
 
                 <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-1">
                   <button data-tour="menu-stores" onClick={() => { setTab('stores'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'stores' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="store" className="w-4 h-4" />
+                    <i data-lucide="store" className="w-4 h-4"></i>
                     <span>Kelola Toko</span>
                   </button>
                   <button data-tour="menu-formbuilder" onClick={() => { setTab('formbuilder'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'formbuilder' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="layout-list" className="w-4 h-4" />
+                    <i data-lucide="layout-list" className="w-4 h-4"></i>
                     <span>Form Builder</span>
                   </button>
                   <button data-tour="menu-sop" onClick={() => { setTab('sop'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'sop' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="book-open" className="w-4 h-4" />
+                    <i data-lucide="book-open" className="w-4 h-4"></i>
                     <span>Panduan SOP</span>
                     <span className="ml-auto text-[10px] bg-indigo-100 text-indigo-700 font-bold px-1.5 py-0.5 rounded-md">{sopCategories.length}</span>
                   </button>
                   <button data-tour="menu-chat" onClick={() => { setTab('chat'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'chat' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="message-circle" className="w-4 h-4" />
+                    <i data-lucide="message-circle" className="w-4 h-4"></i>
                     <span>Chat</span>
                     {totalAdminUnread > 0 && <span className="ml-auto text-[10px] bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded-md">{totalAdminUnread}</span>}
                   </button>
                   <button onClick={() => { setTab('webupdate'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'webupdate' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="megaphone" className="w-4 h-4" />
+                    <i data-lucide="megaphone" className="w-4 h-4"></i>
                     <span>Update Web</span>
                   </button>
                   <button onClick={() => { setTab('devices'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'devices' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="monitor-smartphone" className="w-4 h-4" />
+                    <i data-lucide="monitor-smartphone" className="w-4 h-4"></i>
                     <span>Perangkat</span>
                   </button>
 
                   <div className="pt-3 mt-3 border-t border-slate-100 space-y-1">
                     <button onClick={() => { setShowOnboarding(true); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-all">
-                      <Icon name="help-circle" className="w-4 h-4" />
+                      <i data-lucide="help-circle" className="w-4 h-4"></i>
                       <span>Lihat Tur Panduan</span>
                     </button>
                     <button onClick={onLogout} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-rose-700 hover:bg-rose-50 transition-all">
-                      <Icon name="log-out" className="w-4 h-4" />
+                      <i data-lucide="log-out" className="w-4 h-4"></i>
                       <span>Keluar / Logout</span>
                     </button>
                   </div>
@@ -3135,7 +3149,7 @@ import Icon from './components/Icon.jsx';
           {/* Toast notifikasi pesan chat baru dari toko */}
           {adminToast && (
             <div className="bg-indigo-900 text-white rounded-lg px-4 py-3 shadow-lg fixed bottom-6 right-4 left-4 md:right-8 md:left-auto md:max-w-md z-50 flex items-center space-x-2">
-              <Icon name="message-circle" className="w-5 h-5 text-sky-400 shrink-0" />
+              <i data-lucide="message-circle" className="w-5 h-5 text-sky-400 shrink-0"></i>
               <span className="text-xs font-semibold">{adminToast}</span>
             </div>
           )}
@@ -3192,7 +3206,7 @@ import Icon from './components/Icon.jsx';
                 <div className="flex justify-between items-center flex-wrap gap-2">
                   <h2 className="font-bold text-slate-700 text-base">Daftar Cabang Toko ({stores.length})</h2>
                   <button onClick={() => { setShowAdd(true); setErrorMsg(''); }} className="bg-purple-800 hover:bg-purple-900 text-white text-xs font-bold px-3 py-2 rounded-lg flex items-center gap-1.5">
-                    <Icon name="plus" className="w-3.5 h-3.5" /> Tambah Toko
+                    <i data-lucide="plus" className="w-3.5 h-3.5"></i> Tambah Toko
                   </button>
                 </div>
 
@@ -3210,20 +3224,20 @@ import Icon from './components/Icon.jsx';
                           <p className="text-[10px] text-slate-600">Dibuat: {store.createdAt ? new Date(store.createdAt).toLocaleDateString('id-ID') : '-'}</p>
                           {store.active === false && <span className="inline-block mt-1 text-[9px] font-bold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded">NONAKTIF</span>}
                         </div>
-                        <Icon name="store" className="w-5 h-5 text-purple-600 shrink-0" />
+                        <i data-lucide="store" className="w-5 h-5 text-purple-600 shrink-0"></i>
                       </div>
                       <div className="flex gap-2 mt-3">
                         <button onClick={() => openDetail(store)} className="flex-1 bg-purple-50 text-purple-700 text-xs font-bold py-1.5 rounded-lg border border-purple-100">Lihat Detail</button>
                         <button onClick={() => openChatWithStore(store)} className="relative p-1.5 bg-sky-50 text-sky-700 rounded-lg border border-sky-100">
-                          <Icon name="message-circle" className="w-3.5 h-3.5" />
+                          <i data-lucide="message-circle" className="w-3.5 h-3.5"></i>
                           {unreadByStore[store.id] > 0 && (
                             <span className="absolute -top-1.5 -right-1.5 bg-rose-500 text-white text-[9px] font-bold w-4 h-4 rounded-full flex items-center justify-center">{unreadByStore[store.id] > 9 ? '9+' : unreadByStore[store.id]}</span>
                           )}
                         </button>
                         <button onClick={() => handleToggleActive(store)} title={store.active === false ? 'Aktifkan' : 'Nonaktifkan'} className="p-1.5 bg-amber-50 text-amber-700 rounded-lg border border-amber-100">
-                          <Icon name={store.active === false ? 'play' : 'pause'} className="w-3.5 h-3.5" />
+                          <i data-lucide={store.active === false ? 'play' : 'pause'} className="w-3.5 h-3.5"></i>
                         </button>
-                        <button onClick={() => setConfirmDelete(store)} className="p-1.5 bg-rose-50 text-rose-700 rounded-lg border border-rose-100"><Icon name="trash-2" className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => setConfirmDelete(store)} className="p-1.5 bg-rose-50 text-rose-700 rounded-lg border border-rose-100"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
                       </div>
                     </div>
                   ))}
@@ -3309,7 +3323,7 @@ import Icon from './components/Icon.jsx';
                               <span className="text-xs font-semibold text-slate-700 block truncate">{f.label}{f.unit ? ` (${f.unit})` : ''}</span>
                               <span className="text-[10px] text-purple-600 font-semibold">{getFieldStoreLabel(f)}</span>
                             </div>
-                            <button onClick={() => handleDeleteFormField('sales', f.id)} className="text-rose-500 shrink-0"><Icon name="trash-2" className="w-3.5 h-3.5" /></button>
+                            <button onClick={() => handleDeleteFormField('sales', f.id)} className="text-rose-500 shrink-0"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
                           </div>
                         ))}
                       </div>
@@ -3328,7 +3342,7 @@ import Icon from './components/Icon.jsx';
                               <span className="text-[10px] text-indigo-600 font-semibold block">{getInventorySectionLabel(f.section)}</span>
                               <span className="text-[10px] text-purple-600 font-semibold">{getFieldStoreLabel(f)}</span>
                             </div>
-                            <button onClick={() => handleDeleteFormField('inventory', f.id)} className="text-rose-500 shrink-0"><Icon name="trash-2" className="w-3.5 h-3.5" /></button>
+                            <button onClick={() => handleDeleteFormField('inventory', f.id)} className="text-rose-500 shrink-0"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
                           </div>
                         ))}
                       </div>
@@ -3385,7 +3399,7 @@ import Icon from './components/Icon.jsx';
                           <span key={idx} className="flex items-center gap-1 bg-slate-100 text-slate-600 text-[10px] font-semibold px-2 py-1 rounded-md">
                             {f.type.startsWith('video/') ? '🎥' : '🖼️'} {f.name}
                             <button type="button" onClick={() => setNewSopFiles(prev => prev.filter((_, i) => i !== idx))} className="text-slate-600 hover:text-rose-600 ml-0.5">
-                              <Icon name="x" className="w-3 h-3" />
+                              <i data-lucide="x" className="w-3 h-3"></i>
                             </button>
                           </span>
                         ))}
@@ -3436,8 +3450,8 @@ import Icon from './components/Icon.jsx';
                               <p className="text-[10px] text-indigo-600 font-semibold mt-0.5">{getSopStoreLabel(cat)}</p>
                             </div>
                             <div className="flex gap-1.5 shrink-0">
-                              <button onClick={() => startEditSop(cat)} className="p-1.5 text-slate-500 hover:bg-slate-100 rounded-lg" title="Edit"><Icon name="pencil" className="w-3.5 h-3.5" /></button>
-                              <button onClick={() => setConfirmDeleteSop(cat)} className="p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg" title="Hapus"><Icon name="trash-2" className="w-3.5 h-3.5" /></button>
+                              <button onClick={() => startEditSop(cat)} className="p-1.5 text-slate-500 hover:bg-slate-100 rounded-lg" title="Edit"><i data-lucide="pencil" className="w-3.5 h-3.5"></i></button>
+                              <button onClick={() => setConfirmDeleteSop(cat)} className="p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg" title="Hapus"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
                             </div>
                           </div>
                           {cat.content && <p className="text-xs text-slate-600 mt-2 whitespace-pre-wrap">{cat.content}</p>}
@@ -3464,11 +3478,11 @@ import Icon from './components/Icon.jsx';
                                 )}
                                 {m.type === 'video' && (
                                   <div className="absolute inset-0 flex items-center justify-center bg-black/20">
-                                    <Icon name="play-circle" className="w-6 h-6 text-white" />
+                                    <i data-lucide="play-circle" className="w-6 h-6 text-white"></i>
                                   </div>
                                 )}
                                 <button onClick={() => handleDeleteSopMedia(cat.id, m)} className="absolute top-1 right-1 bg-black/60 hover:bg-rose-600 text-white rounded-full p-1" title="Hapus file">
-                                  <Icon name="x" className="w-3 h-3" />
+                                  <i data-lucide="x" className="w-3 h-3"></i>
                                 </button>
                               </div>
                             ))}
@@ -3487,7 +3501,7 @@ import Icon from './components/Icon.jsx';
                   <h3 className="font-bold text-slate-700 text-sm px-2 pb-2 border-b border-slate-100 mb-2">Pilih Toko</h3>
                   {stores.length > 5 && (
                     <div className="relative mb-2">
-                      <Icon name="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <i data-lucide="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"></i>
                       <input
                         type="text"
                         value={chatStoreQuery}
@@ -3526,7 +3540,7 @@ import Icon from './components/Icon.jsx';
               <div className="max-w-xl mx-auto space-y-4">
                 <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
                   <div>
-                    <h3 className="font-bold text-slate-800 text-sm flex items-center gap-1.5"><Icon name="megaphone" className="w-4 h-4 text-purple-700" /> Broadcast Update Web</h3>
+                    <h3 className="font-bold text-slate-800 text-sm flex items-center gap-1.5"><i data-lucide="megaphone" className="w-4 h-4 text-purple-700"></i> Broadcast Update Web</h3>
                     <p className="text-[10px] text-slate-500 mt-1">Kirim informasi pembaruan sistem web langsung ke grup/channel Telegram toko lewat Bot Telegram masing-masing toko.</p>
                   </div>
 
@@ -3569,7 +3583,7 @@ import Icon from './components/Icon.jsx';
                     disabled={sendingWebUpdate || !webUpdateText.trim()}
                     className="w-full flex items-center justify-center gap-2 bg-purple-800 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm"
                   >
-                    <Icon name="send" className="w-4 h-4" />
+                    <i data-lucide="send" className="w-4 h-4"></i>
                     {sendingWebUpdate ? 'Mengirim...' : 'Kirim'}
                   </button>
 
@@ -3591,7 +3605,7 @@ import Icon from './components/Icon.jsx';
               <div className="max-w-3xl mx-auto space-y-4">
                 <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-1">
                   <h3 className="font-bold text-slate-800 text-sm flex items-center gap-1.5">
-                    <Icon name="monitor-smartphone" className="w-4 h-4 text-purple-700" /> Monitor Perangkat Login
+                    <i data-lucide="monitor-smartphone" className="w-4 h-4 text-purple-700"></i> Monitor Perangkat Login
                   </h3>
                   <p className="text-[10px] text-slate-500">
                     Pantau semua perangkat yang sedang login di tiap toko. Tidak ada lagi batas jumlah device per toko —
@@ -3602,7 +3616,7 @@ import Icon from './components/Icon.jsx';
 
                 {loadingDevices && Object.keys(devicesData).length === 0 && (
                   <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-8 text-center text-slate-500 text-xs">
-                    <Icon name="loader" className="w-5 h-5 animate-spin mx-auto mb-2" /> Memuat data perangkat...
+                    <i data-lucide="loader" className="w-5 h-5 animate-spin mx-auto mb-2"></i> Memuat data perangkat...
                   </div>
                 )}
 
@@ -3629,7 +3643,7 @@ import Icon from './components/Icon.jsx';
                               <div key={d.deviceId} className="flex items-center justify-between gap-2 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2.5">
                                 <div className="min-w-0">
                                   <div className="flex items-center gap-1.5">
-                                    <Icon name="smartphone" className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                                    <i data-lucide="smartphone" className="w-3.5 h-3.5 text-slate-500 shrink-0"></i>
                                     <span className="text-xs font-bold text-slate-700 truncate">{d.deviceLabel || 'Perangkat tidak dikenal'}</span>
                                     <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0 ${d.isActive ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-200 text-slate-500'}`}>
                                       {d.isActive ? 'Aktif' : 'Tidak Aktif'}
@@ -3646,7 +3660,7 @@ import Icon from './components/Icon.jsx';
                                   disabled={kickingDevice === kickKey}
                                   className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 disabled:opacity-50 border border-rose-100 px-2.5 py-1.5 rounded-lg"
                                 >
-                                  <Icon name={kickingDevice === kickKey ? 'loader' : 'log-out'} className={`w-3 h-3 ${kickingDevice === kickKey ? 'animate-spin' : ''}`} />
+                                  <i data-lucide={kickingDevice === kickKey ? 'loader' : 'log-out'} className={`w-3 h-3 ${kickingDevice === kickKey ? 'animate-spin' : ''}`}></i>
                                   Logout Paksa
                                 </button>
                               </div>
@@ -3688,7 +3702,7 @@ import Icon from './components/Icon.jsx';
             <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
               <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
                 <div className="flex items-center gap-2 mb-3 text-emerald-600">
-                  <Icon name="check-circle" className="w-5 h-5" />
+                  <i data-lucide="check-circle" className="w-5 h-5"></i>
                   <h3 className="font-bold text-slate-800">Toko "{createdToken.name}" Dibuat!</h3>
                 </div>
                 <p className="text-xs text-slate-500 mb-3">Salin token ini dan berikan ke toko. Token <b>hanya ditampilkan sekali</b> dan tidak bisa dilihat lagi setelah ini.</p>
@@ -3826,23 +3840,23 @@ import Icon from './components/Icon.jsx';
                       {isStoreOnline(storesPresence[detailStore.id]) ? 'Sedang dibuka' : 'Offline'}
                     </span>
                   </h3>
-                  <button onClick={() => setDetailStore(null)} className="text-slate-600 hover:text-slate-600"><Icon name="x" className="w-5 h-5" /></button>
+                  <button onClick={() => setDetailStore(null)} className="text-slate-600 hover:text-slate-600"><i data-lucide="x" className="w-5 h-5"></i></button>
                 </div>
                 {detailLoading ? (
                   <StoreDetailSkeleton />
                 ) : detailData ? (
                   <div className="space-y-6">
                     <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
-                      <h4 className="font-bold text-slate-700 text-sm flex items-center gap-1.5"><Icon name="key-round" className="w-3.5 h-3.5" /> Kredensial Login Toko</h4>
+                      <h4 className="font-bold text-slate-700 text-sm flex items-center gap-1.5"><i data-lucide="key-round" className="w-3.5 h-3.5"></i> Kredensial Login Toko</h4>
                       <div className="flex items-center gap-2">
                         <div className="flex-1 bg-white border border-slate-200 rounded-lg px-3 py-2 font-mono text-sm select-all">
                           {detailStore.token ? (showToken ? detailStore.token : '•'.repeat(Math.min(detailStore.token.length, 16))) : '(tidak tersedia — dibuat sebelum fitur ini ada, gunakan Reset Token)'}
                         </div>
                         {detailStore.token && (
-                          <button onClick={() => setShowToken(v => !v)} className="shrink-0 p-2 bg-white border border-slate-200 rounded-lg text-slate-500"><Icon name={showToken ? 'eye-off' : 'eye'} className="w-4 h-4" /></button>
+                          <button onClick={() => setShowToken(v => !v)} className="shrink-0 p-2 bg-white border border-slate-200 rounded-lg text-slate-500"><i data-lucide={showToken ? 'eye-off' : 'eye'} className="w-4 h-4"></i></button>
                         )}
                         {detailStore.token && (
-                          <button onClick={() => navigator.clipboard?.writeText(detailStore.token)} className="shrink-0 p-2 bg-white border border-slate-200 rounded-lg text-slate-500"><Icon name="copy" className="w-4 h-4" /></button>
+                          <button onClick={() => navigator.clipboard?.writeText(detailStore.token)} className="shrink-0 p-2 bg-white border border-slate-200 rounded-lg text-slate-500"><i data-lucide="copy" className="w-4 h-4"></i></button>
                         )}
                       </div>
                       <button onClick={() => handleRegenerateToken(detailStore)} disabled={regeneratingToken || settingCustomToken} className="w-full bg-slate-800 disabled:opacity-50 text-white text-xs font-bold py-2 rounded-lg">
@@ -3880,7 +3894,7 @@ import Icon from './components/Icon.jsx';
                     </div>
 
                     <div className="bg-sky-50 border border-sky-200 rounded-xl p-4 space-y-3">
-                      <h4 className="font-bold text-slate-700 text-sm flex items-center gap-1.5"><Icon name="send" className="w-3.5 h-3.5" /> Integrasi Bot Telegram</h4>
+                      <h4 className="font-bold text-slate-700 text-sm flex items-center gap-1.5"><i data-lucide="send" className="w-3.5 h-3.5"></i> Integrasi Bot Telegram</h4>
                       <p className="text-[10px] text-slate-500">Hanya admin yang dapat mengatur ini. Toko tidak lagi bisa mengubah Bot Token / Chat ID sendiri.</p>
                       <div>
                         <label htmlFor="telegramForm_botToken" className="block text-[10px] font-semibold text-slate-600 mb-1">Bot Token</label>
@@ -3911,7 +3925,7 @@ import Icon from './components/Icon.jsx';
                         <h4 className="font-bold text-slate-700 text-sm">Riwayat Penjualan & Stok</h4>
                         {getOldReportEntries(detailData.historyList).length > 0 && (
                           <button onClick={() => setConfirmDeleteOldReports(true)} className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-100 px-2 py-1.5 rounded-lg">
-                            <Icon name="trash-2" className="w-3 h-3" /> Hapus Laporan ≥7 Hari ({getOldReportEntries(detailData.historyList).length})
+                            <i data-lucide="trash-2" className="w-3 h-3"></i> Hapus Laporan ≥7 Hari ({getOldReportEntries(detailData.historyList).length})
                           </button>
                         )}
                       </div>
@@ -3930,7 +3944,7 @@ import Icon from './components/Icon.jsx';
                                     className="shrink-0 p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg"
                                     title="Hapus laporan ini"
                                   >
-                                    <Icon name="trash-2" className="w-3.5 h-3.5" />
+                                    <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
                                   </button>
                                 </span>
                               </summary>
@@ -3969,7 +3983,7 @@ import Icon from './components/Icon.jsx';
                                 className="absolute top-1 right-1 p-1 bg-white/90 text-rose-600 rounded-lg shadow border border-rose-100 hover:bg-rose-50"
                                 title="Hapus foto ini"
                               >
-                                <Icon name="trash-2" className="w-3 h-3" />
+                                <i data-lucide="trash-2" className="w-3 h-3"></i>
                               </button>
                             </div>
                           ))}
@@ -3995,7 +4009,7 @@ import Icon from './components/Icon.jsx';
                                     className="shrink-0 p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg"
                                     title="Hapus PO ini"
                                   >
-                                    <Icon name="trash-2" className="w-3.5 h-3.5" />
+                                    <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
                                   </button>
                                 </span>
                               </summary>
@@ -4028,7 +4042,7 @@ import Icon from './components/Icon.jsx';
                                     className="shrink-0 p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg"
                                     title="Hapus BAP ini"
                                   >
-                                    <Icon name="trash-2" className="w-3.5 h-3.5" />
+                                    <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
                                   </button>
                                 </span>
                               </summary>
@@ -4163,7 +4177,7 @@ import Icon from './components/Icon.jsx';
       if (checking) {
         return (
           <div className="min-h-screen flex items-center justify-center bg-slate-50">
-            <Icon name="loader" className="w-8 h-8 text-purple-700 animate-spin" />
+            <i data-lucide="loader" className="w-8 h-8 text-purple-700 animate-spin"></i>
           </div>
         );
       }
@@ -6660,7 +6674,7 @@ Daily inventory done✅
                   className="p-2 -ml-1 bg-purple-700/60 hover:bg-purple-600 rounded-lg text-white border border-purple-500/30 transition-all"
                   title="Menu"
                 >
-                  <Icon name="menu" className="w-5 h-5" />
+                  <i data-lucide="menu" className="w-5 h-5"></i>
                 </button>
                 <div className="bg-white text-purple-800 w-8 h-8 rounded-full font-bold flex items-center justify-center text-md tracking-wider">
                   TB
@@ -6682,7 +6696,7 @@ Daily inventory done✅
                   className="relative p-2 bg-purple-700/60 hover:bg-purple-600 rounded-lg text-white border border-purple-500/30 transition-all"
                   title="Chat dengan Admin"
                 >
-                  <Icon name="message-circle" className="w-5 h-5" />
+                  <i data-lucide="message-circle" className="w-5 h-5"></i>
                   {unreadChat > 0 && (
                     <span className="absolute -top-1 -right-1 bg-rose-500 text-white text-[9px] font-bold w-4 h-4 rounded-full flex items-center justify-center">{unreadChat > 9 ? '9+' : unreadChat}</span>
                   )}
@@ -6692,7 +6706,7 @@ Daily inventory done✅
                   className="p-2 bg-purple-700/60 hover:bg-rose-600 rounded-lg text-white border border-purple-500/30 transition-all"
                   title="Keluar"
                 >
-                  <Icon name="log-out" className="w-5 h-5" />
+                  <i data-lucide="log-out" className="w-5 h-5"></i>
                 </button>
               </div>
             </div>
@@ -6703,7 +6717,7 @@ Daily inventory done✅
               bukan baru tahu setelah tombol "Simpan" gagal & harus mengulang. */}
           {!isNetworkOnline && (
             <div className="bg-rose-600 text-white text-center text-xs font-bold px-4 py-2 flex items-center justify-center gap-2 sticky top-[52px] z-20">
-              <Icon name="wifi-off" className="w-3.5 h-3.5" />
+              <i data-lucide="wifi-off" className="w-3.5 h-3.5"></i>
               Tidak ada koneksi internet — data belum tentu tersimpan. Periksa WiFi/kuota Anda.
             </div>
           )}
@@ -6738,75 +6752,75 @@ Daily inventory done✅
                     </div>
                   </div>
                   <button onClick={() => setShowMenu(false)} className="p-1.5 hover:bg-white/10 rounded-lg">
-                    <Icon name="x" className="w-5 h-5" />
+                    <i data-lucide="x" className="w-5 h-5"></i>
                   </button>
                 </div>
 
                 <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-1">
                   <button data-tour="menu-dashboard" onClick={() => { setActiveTab('dashboard'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'dashboard' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="trending-up" className="w-4 h-4" />
+                    <i data-lucide="trending-up" className="w-4 h-4"></i>
                     <span>Dasbor</span>
                   </button>
                   <button data-tour="menu-sales" onClick={() => { setActiveTab('sales'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'sales' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="plus-circle" className="w-4 h-4" />
+                    <i data-lucide="plus-circle" className="w-4 h-4"></i>
                     <span>Laporan Penjualan</span>
                   </button>
                   <button data-tour="menu-inventory" onClick={() => { setActiveTab('inventory'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'inventory' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="package" className="w-4 h-4" />
+                    <i data-lucide="package" className="w-4 h-4"></i>
                     <span>SO Stok</span>
                   </button>
                   <button data-tour="menu-preorder" onClick={() => { setActiveTab('preorder'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'preorder' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="calendar-clock" className="w-4 h-4" />
+                    <i data-lucide="calendar-clock" className="w-4 h-4"></i>
                     <span>PO (Pre Order)</span>
                   </button>
                   <button data-tour="menu-bap" onClick={() => { setActiveTab('bap'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'bap' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="clipboard-check" className="w-4 h-4" />
+                    <i data-lucide="clipboard-check" className="w-4 h-4"></i>
                     <span>BAP (Berita Acara Penyesuaian)</span>
                   </button>
                   <button data-tour="menu-kedatangan" onClick={() => { setActiveTab('kedatangan'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'kedatangan' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="truck" className="w-4 h-4" />
+                    <i data-lucide="truck" className="w-4 h-4"></i>
                     <span>Datang Barang</span>
                   </button>
                   <button data-tour="menu-wasteFoto" onClick={() => { setActiveTab('wasteFoto'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'wasteFoto' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="camera" className="w-4 h-4" />
+                    <i data-lucide="camera" className="w-4 h-4"></i>
                     <span>Foto Rijek</span>
                     <span className="ml-auto text-[10px] bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded-md">{wasteFotoList.length}</span>
                   </button>
                   <button data-tour="menu-printing" onClick={() => { setActiveTab('printing'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'printing' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="printer" className="w-4 h-4" />
+                    <i data-lucide="printer" className="w-4 h-4"></i>
                     <span>Printing</span>
                   </button>
                   <button data-tour="menu-history" onClick={() => { setActiveTab('history'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'history' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="history" className="w-4 h-4" />
+                    <i data-lucide="history" className="w-4 h-4"></i>
                     <span>Riwayat Laporan</span>
                     <span className="ml-auto text-[10px] bg-indigo-100 text-indigo-700 font-bold px-1.5 py-0.5 rounded-md">{historyList.length}</span>
                   </button>
                   <button data-tour="menu-sop" onClick={() => { setActiveTab('sop'); setSelectedSopCategory(null); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'sop' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="book-open" className="w-4 h-4" />
+                    <i data-lucide="book-open" className="w-4 h-4"></i>
                     <span>Panduan SOP</span>
                     <span className="ml-auto text-[10px] bg-indigo-100 text-indigo-700 font-bold px-1.5 py-0.5 rounded-md">{sopCategories.length}</span>
                   </button>
                   <button data-tour="menu-chat" onClick={() => { setActiveTab('chat'); setUnreadChat(0); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'chat' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
-                    <Icon name="message-circle" className="w-4 h-4" />
+                    <i data-lucide="message-circle" className="w-4 h-4"></i>
                     <span>Chat Admin</span>
                     {unreadChat > 0 && <span className="ml-auto text-[10px] bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded-md">{unreadChat}</span>}
                   </button>
 
                   <div className="pt-3 mt-3 border-t border-slate-100 space-y-1">
                     <button onClick={() => { setShowConfig(!showConfig); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-all">
-                      <Icon name="settings" className="w-4 h-4" />
+                      <i data-lucide="settings" className="w-4 h-4"></i>
                       <span>Pengaturan Integrasi</span>
                     </button>
                     <button onClick={() => { handleLoadSampleData(); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-amber-700 hover:bg-amber-50 transition-all">
-                      <Icon name="sparkles" className="w-4 h-4" />
+                      <i data-lucide="sparkles" className="w-4 h-4"></i>
                       <span>Muat Data Contoh</span>
                     </button>
                     <button onClick={() => { setShowOnboarding(true); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-all">
-                      <Icon name="help-circle" className="w-4 h-4" />
+                      <i data-lucide="help-circle" className="w-4 h-4"></i>
                       <span>Lihat Tur Panduan</span>
                     </button>
                     <button onClick={onLogout} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-rose-700 hover:bg-rose-50 transition-all">
-                      <Icon name="log-out" className="w-4 h-4" />
+                      <i data-lucide="log-out" className="w-4 h-4"></i>
                       <span>Keluar / Logout</span>
                     </button>
                   </div>
@@ -6823,14 +6837,14 @@ Daily inventory done✅
               <div className="bg-white rounded-2xl p-5 border border-purple-200 shadow-md mb-6 transition-all">
                 <div className="flex justify-between items-center pb-2 border-b border-slate-100 mb-4">
                   <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
-                    <Icon name="settings" className="w-4 h-4 text-purple-700" />
+                    <i data-lucide="settings" className="w-4 h-4 text-purple-700"></i>
                     <span>Pengaturan Integrasi Eksternal</span>
                   </h3>
                   <button onClick={() => setShowConfig(false)} className="text-slate-600 hover:text-slate-600 text-xs font-bold">Tutup</button>
                 </div>
                 <form onSubmit={handleSaveConfig} className="space-y-4">
                   <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
-                    <p className="text-xs font-semibold text-slate-600 flex items-center gap-1.5 mb-2"><Icon name="lock" className="w-3.5 h-3.5" /> Integrasi Bot Telegram</p>
+                    <p className="text-xs font-semibold text-slate-600 flex items-center gap-1.5 mb-2"><i data-lucide="lock" className="w-3.5 h-3.5"></i> Integrasi Bot Telegram</p>
                     <p className="text-[11px] text-slate-500 mb-2">Bot Token & Chat ID sekarang diatur langsung oleh Admin Pusat dan tidak bisa diubah dari sini.</p>
                     <p className="text-[11px] font-mono text-slate-600">
                       Status: {config.telegramBotToken && config.telegramChatId ? <span className="text-emerald-600 font-bold">✓ Terhubung</span> : <span className="text-rose-500 font-bold">Belum diatur admin</span>}
@@ -6864,7 +6878,7 @@ Daily inventory done✅
                 <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
                   <div className="flex items-center gap-2 mb-2">
                     <div className="w-9 h-9 rounded-full bg-wheat-50 flex items-center justify-center shrink-0">
-                      <Icon name="alert-triangle" className="w-4 h-4 text-wheat-600" />
+                      <i data-lucide="alert-triangle" className="w-4 h-4 text-wheat-600"></i>
                     </div>
                     <h3 className="font-bold text-slate-800">Ada {emptyFieldsForModal.length} Field Kosong</h3>
                   </div>
@@ -6888,7 +6902,7 @@ Daily inventory done✅
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-6 flex flex-wrap items-center justify-between gap-4">
               <div className="flex items-center space-x-3">
                 <div className="bg-indigo-50 p-2.5 rounded-lg text-indigo-600">
-                  <Icon name="file-text" className="w-5 h-5" />
+                  <i data-lucide="file-text" className="w-5 h-5"></i>
                 </div>
                 <div>
                   <p className="text-[10px] text-slate-600 font-bold uppercase tracking-wider">Tanggal Kerja Aktif</p>
@@ -6919,7 +6933,7 @@ Daily inventory done✅
             {/* Notifications */}
             {notification && (
               <div className="bg-indigo-900 text-white rounded-lg px-4 py-3 shadow-lg fixed bottom-24 right-4 left-4 md:right-8 md:left-auto md:max-w-md z-50 flex items-center space-x-2">
-                <Icon name="check-circle" className="w-5 h-5 text-green-400" />
+                <i data-lucide="check-circle" className="w-5 h-5 text-green-400"></i>
                 <span className="text-xs font-semibold">{notification}</span>
               </div>
             )}
@@ -6958,7 +6972,7 @@ Daily inventory done✅
                 <div className="bg-white rounded-2xl p-5 border border-purple-100 shadow-sm">
                   <div className="pb-3 border-b border-slate-100 mb-4">
                     <h3 className="font-bold text-slate-800 text-sm md:text-base flex items-center gap-2">
-                      <Icon name="trending-up" className="w-5 h-5 text-purple-700" />
+                      <i data-lucide="trending-up" className="w-5 h-5 text-purple-700"></i>
                       <span>Kebutuhan Bahan Bakery (Dough & Fillings)</span>
                     </h3>
                     <p className="text-xs text-slate-600">Konversi otomatis (x25g / 1000) ke satuan KG</p>
@@ -7026,7 +7040,7 @@ Daily inventory done✅
                 <div className="bg-white rounded-2xl p-5 border border-sky-100 shadow-sm">
                   <div className="pb-3 border-b border-slate-100 mb-4">
                     <h3 className="font-bold text-slate-800 text-sm md:text-base flex items-center gap-2">
-                      <Icon name="coffee" className="w-5 h-5 text-sky-600" />
+                      <i data-lucide="coffee" className="w-5 h-5 text-sky-600"></i>
                       <span>Kebutuhan Bahan Minuman (Hasil Konsolidasi)</span>
                     </h3>
                     <p className="text-xs text-slate-600">Penggabungan semua resep varian Taro yang terjual hari ini ke satuan KG</p>
@@ -7106,22 +7120,22 @@ Daily inventory done✅
 
                   {emptyReportFieldsPreview.length > 0 && (
                     <div className="bg-wheat-50/95 border border-wheat-500/40 text-wheat-600 text-[11px] rounded-xl p-2.5 mb-3 flex items-start gap-1.5">
-                      <Icon name="alert-triangle" className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <i data-lucide="alert-triangle" className="w-3.5 h-3.5 shrink-0 mt-0.5"></i>
                       <span><b>{emptyReportFieldsPreview.length} field belum diisi.</b> Boleh disimpan dulu; wajib diisi (atau otomatis jadi 0) saat mau Kirim Telegram/WA.</span>
                     </div>
                   )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                     <button onClick={handleSaveToDevice} className="bg-white text-indigo-950 font-bold text-xs py-2.5 rounded-xl flex items-center justify-center space-x-2 shadow-sm hover:bg-slate-100 transition-colors">
-                      <Icon name="cloud" className="w-4 h-4 text-indigo-800" />
+                      <i data-lucide="cloud" className="w-4 h-4 text-indigo-800"></i>
                       <span>Simpan di Cloud</span>
                     </button>
                     <button onClick={() => requestSendReport('telegram')} className="bg-sky-500 text-white font-bold text-xs py-2.5 rounded-xl flex items-center justify-center space-x-2 shadow-sm hover:bg-sky-400 transition-colors">
-                      <Icon name="send" className="w-4 h-4" />
+                      <i data-lucide="send" className="w-4 h-4"></i>
                       <span>Kirim Telegram</span>
                     </button>
                     <button onClick={() => requestSendReport('wa')} className="bg-emerald-600 text-white font-bold text-xs py-2.5 rounded-xl flex items-center justify-center space-x-2 shadow-sm hover:bg-emerald-500 transition-colors">
-                      <Icon name="share-2" className="w-4 h-4" />
+                      <i data-lucide="share-2" className="w-4 h-4"></i>
                       <span>Kirim WA</span>
                     </button>
                   </div>
@@ -7295,7 +7309,7 @@ Daily inventory done✅
                 {/* Field Tambahan dari Admin (Form Builder) */}
                 {customSalesFields.length > 0 && (
                   <div>
-                    <h4 className="font-bold text-slate-700 text-sm mb-2 flex items-center gap-1.5"><Icon name="sparkles" className="w-3.5 h-3.5 text-purple-600" /> Data Tambahan</h4>
+                    <h4 className="font-bold text-slate-700 text-sm mb-2 flex items-center gap-1.5"><i data-lucide="sparkles" className="w-3.5 h-3.5 text-purple-600"></i> Data Tambahan</h4>
                     <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                       {customSalesFields.map(f => (
                         <div key={f.id}>
@@ -7317,7 +7331,7 @@ Daily inventory done✅
                 {/* Pemberitahuan field kosong — hanya notifikasi, TIDAK menghalangi Simpan */}
                 {emptyReportFieldsPreview.length > 0 && (
                   <div className="bg-wheat-50 border border-wheat-500/40 text-wheat-600 text-xs rounded-xl p-3 flex items-start gap-2">
-                    <Icon name="alert-triangle" className="w-4 h-4 shrink-0 mt-0.5" />
+                    <i data-lucide="alert-triangle" className="w-4 h-4 shrink-0 mt-0.5"></i>
                     <div>
                       <p className="font-bold">{emptyReportFieldsPreview.length} field belum diisi:</p>
                       <p className="mt-0.5">{emptyReportFieldsPreview.slice(0, 12).map(f => f.label).join(', ')}{emptyReportFieldsPreview.length > 12 ? `, +${emptyReportFieldsPreview.length - 12} lainnya` : ''}</p>
@@ -7562,7 +7576,7 @@ Daily inventory done✅
                     atau field lama sebelum fitur pemilihan Bagian ini ada (belum punya section) */}
                 {customInventoryFields.filter(f => !f.section || f.section === 'lainnya').length > 0 && (
                   <div className="space-y-4">
-                    <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2 flex items-center gap-1.5"><Icon name="sparkles" className="w-3.5 h-3.5" /> Data Tambahan</h4>
+                    <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2 flex items-center gap-1.5"><i data-lucide="sparkles" className="w-3.5 h-3.5"></i> Data Tambahan</h4>
                     <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-xs">
                       {customInventoryFields.filter(f => !f.section || f.section === 'lainnya').map(f => (
                         <div key={f.id}>
@@ -7584,7 +7598,7 @@ Daily inventory done✅
                 {/* Pemberitahuan field kosong — hanya notifikasi, TIDAK menghalangi Simpan */}
                 {emptyReportFieldsPreview.length > 0 && (
                   <div className="bg-wheat-50 border border-wheat-500/40 text-wheat-600 text-xs rounded-xl p-3 flex items-start gap-2">
-                    <Icon name="alert-triangle" className="w-4 h-4 shrink-0 mt-0.5" />
+                    <i data-lucide="alert-triangle" className="w-4 h-4 shrink-0 mt-0.5"></i>
                     <div>
                       <p className="font-bold">{emptyReportFieldsPreview.length} field belum diisi (Laporan Penjualan + SO Stok):</p>
                       <p className="mt-0.5">{emptyReportFieldsPreview.slice(0, 12).map(f => f.label).join(', ')}{emptyReportFieldsPreview.length > 12 ? `, +${emptyReportFieldsPreview.length - 12} lainnya` : ''}</p>
@@ -7680,14 +7694,14 @@ Daily inventory done✅
                         onClick={() => setPreOrderForm({ ...preOrderForm, metodePickup: 'ambilSendiri' })}
                         className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-bold border transition-all ${preOrderForm.metodePickup === 'ambilSendiri' ? 'bg-purple-600 text-white border-purple-600' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
                       >
-                        <Icon name="user-check" className="w-4 h-4" />
+                        <i data-lucide="user-check" className="w-4 h-4"></i>
                         <span>Ambil Sendiri</span>
                       </button>
                       <button
                         onClick={() => setPreOrderForm({ ...preOrderForm, metodePickup: 'ojol' })}
                         className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-bold border transition-all ${preOrderForm.metodePickup === 'ojol' ? 'bg-purple-600 text-white border-purple-600' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
                       >
-                        <Icon name="bike" className="w-4 h-4" />
+                        <i data-lucide="bike" className="w-4 h-4"></i>
                         <span>Ojek Online</span>
                       </button>
                     </div>
@@ -7704,18 +7718,18 @@ Daily inventory done✅
                           className="absolute -top-2 -right-2 bg-rose-600 text-white rounded-full p-1.5 shadow-md hover:bg-rose-700"
                           title="Hapus foto"
                         >
-                          <Icon name="x" className="w-3.5 h-3.5" />
+                          <i data-lucide="x" className="w-3.5 h-3.5"></i>
                         </button>
                       </div>
                     ) : (
                       <div className="grid grid-cols-2 gap-3">
                         <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
-                          <Icon name="camera" className="w-6 h-6 text-purple-700" />
+                          <i data-lucide="camera" className="w-6 h-6 text-purple-700"></i>
                           <span className="text-xs font-bold text-slate-600">Foto Langsung</span>
                           <input type="file" accept="image/*" capture="environment" onChange={handleBuktiFotoFileChange} className="hidden" />
                         </label>
                         <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
-                          <Icon name="image" className="w-6 h-6 text-indigo-700" />
+                          <i data-lucide="image" className="w-6 h-6 text-indigo-700"></i>
                           <span className="text-xs font-bold text-slate-600">Pilih Galeri</span>
                           <input type="file" accept="image/*" onChange={handleBuktiFotoFileChange} className="hidden" />
                         </label>
@@ -7729,7 +7743,7 @@ Daily inventory done✅
                     disabled={isSavingPreOrder}
                     className="w-full bg-purple-700 hover:bg-purple-800 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
                   >
-                    <Icon name="send" className="w-4 h-4" />
+                    <i data-lucide="send" className="w-4 h-4"></i>
                     <span>{isSavingPreOrder ? 'Mengirim...' : 'Simpan & Kirim ke Telegram'}</span>
                   </button>
                 </div>
@@ -7754,7 +7768,7 @@ Daily inventory done✅
                             </span>
                           </div>
                           <button onClick={() => handleDeletePreOrder(po.firebaseKey)} className="text-rose-500 shrink-0" title="Hapus">
-                            <Icon name="trash-2" className="w-4 h-4" />
+                            <i data-lucide="trash-2" className="w-4 h-4"></i>
                           </button>
                         </div>
                       ))}
@@ -7881,14 +7895,14 @@ Daily inventory done✅
                       disabled={isSavingBap}
                       className="bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
                     >
-                      <Icon name={isSavingBap ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingBap ? 'animate-spin' : ''}`} />
+                      <i data-lucide={isSavingBap ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingBap ? 'animate-spin' : ''}`}></i>
                       <span>{isSavingBap ? 'Menyimpan...' : 'Simpan ke Riwayat'}</span>
                     </button>
                     <button
                       onClick={() => handleSendBapToTelegram(bapForm)}
                       className="bg-sky-500 hover:bg-sky-400 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
                     >
-                      <Icon name="send" className="w-4 h-4" />
+                      <i data-lucide="send" className="w-4 h-4"></i>
                       <span>Kirim Telegram</span>
                     </button>
                   </div>
@@ -7903,7 +7917,7 @@ Daily inventory done✅
 
                   {bapHistoryList.length === 0 ? (
                     <div className="text-center py-10 text-slate-600">
-                      <Icon name="clipboard-check" className="w-10 h-10 mx-auto mb-2 text-slate-600" />
+                      <i data-lucide="clipboard-check" className="w-10 h-10 mx-auto mb-2 text-slate-600"></i>
                       <p className="text-sm font-medium">Belum ada riwayat laporan BAP.</p>
                     </div>
                   ) : (
@@ -7919,8 +7933,8 @@ Daily inventory done✅
                           </div>
                           <div className="flex items-center space-x-2 flex-shrink-0">
                             <button onClick={() => loadBapToActive(item)} className="bg-purple-50 text-purple-700 text-xs font-bold px-2.5 py-1.5 rounded-lg border border-purple-100">Buka</button>
-                            <button onClick={() => handleSendBapToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1.5 rounded-lg border border-sky-100" title="Kirim Telegram"><Icon name="send" className="w-3.5 h-3.5" /></button>
-                            <button onClick={() => handleDeleteBap(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100" title="Hapus"><Icon name="trash-2" className="w-4 h-4" /></button>
+                            <button onClick={() => handleSendBapToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1.5 rounded-lg border border-sky-100" title="Kirim Telegram"><i data-lucide="send" className="w-3.5 h-3.5"></i></button>
+                            <button onClick={() => handleDeleteBap(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100" title="Hapus"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
                           </div>
                         </div>
                       ))}
@@ -7976,7 +7990,7 @@ Daily inventory done✅
                   {/* Section: Frozen Dough s/d Filling - Kop Khusus */}
                   <div className="space-y-3">
                     <h4 className="text-xs font-extrabold text-purple-800 uppercase tracking-wider border-b border-purple-50 pb-2 flex items-center gap-1.5">
-                      <Icon name="file-signature" className="w-3.5 h-3.5" />
+                      <i data-lucide="file-signature" className="w-3.5 h-3.5"></i>
                       <span>Frozen Dough s.d. Filling (Kop Khusus)</span>
                     </h4>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -8013,7 +8027,7 @@ Daily inventory done✅
                   {/* Section: Barang Umum */}
                   <div className="space-y-3">
                     <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2 flex items-center gap-1.5">
-                      <Icon name="package" className="w-3.5 h-3.5" />
+                      <i data-lucide="package" className="w-3.5 h-3.5"></i>
                       <span>Barang Umum</span>
                     </h4>
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
@@ -8036,7 +8050,7 @@ Daily inventory done✅
                   {/* Section: Barang Tidak Sesuai Faktur/Surat Jalan */}
                   <div className="space-y-3">
                     <h4 className="text-xs font-extrabold text-rose-700 uppercase tracking-wider border-b border-rose-50 pb-2 flex items-center gap-1.5">
-                      <Icon name="package-x" className="w-3.5 h-3.5" />
+                      <i data-lucide="package-x" className="w-3.5 h-3.5"></i>
                       <span>Barang Tidak Sesuai Faktur/Surat Jalan</span>
                     </h4>
                     <p className="text-[11px] text-slate-600">Untuk barang yang tertulis di faktur tapi tidak datang, atau datang tidak sesuai jumlah/jenis.</p>
@@ -8078,7 +8092,7 @@ Daily inventory done✅
                         onClick={handleAddTidakSesuai}
                         className="bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-lg flex items-center justify-center gap-1.5 py-1.5"
                       >
-                        <Icon name="plus" className="w-3.5 h-3.5" />
+                        <i data-lucide="plus" className="w-3.5 h-3.5"></i>
                         <span>Tambah</span>
                       </button>
                     </div>
@@ -8092,7 +8106,7 @@ Daily inventory done✅
                               {it.keterangan && <p className="text-[10px] text-slate-500">{it.keterangan}</p>}
                             </div>
                             <button onClick={() => handleRemoveTidakSesuai(it.id)} className="text-rose-600 hover:bg-rose-100 p-1.5 rounded-lg">
-                              <Icon name="trash-2" className="w-3.5 h-3.5" />
+                              <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
                             </button>
                           </div>
                         ))}
@@ -8107,14 +8121,14 @@ Daily inventory done✅
                       disabled={isSavingKedatangan}
                       className="flex-1 bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
                     >
-                      <Icon name={isSavingKedatangan ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingKedatangan ? 'animate-spin' : ''}`} />
+                      <i data-lucide={isSavingKedatangan ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingKedatangan ? 'animate-spin' : ''}`}></i>
                       <span>{isSavingKedatangan ? 'Menyimpan...' : 'Simpan ke Riwayat'}</span>
                     </button>
                     <button
                       onClick={() => handleSendKedatanganToTelegram(kedatanganForm)}
                       className="bg-sky-500 hover:bg-sky-400 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
                     >
-                      <Icon name="send" className="w-4 h-4" />
+                      <i data-lucide="send" className="w-4 h-4"></i>
                       <span>Kirim Telegram</span>
                     </button>
                   </div>
@@ -8129,7 +8143,7 @@ Daily inventory done✅
 
                   {kedatanganHistoryList.length === 0 ? (
                     <div className="text-center py-10 text-slate-600">
-                      <Icon name="truck" className="w-10 h-10 mx-auto mb-2 text-slate-600" />
+                      <i data-lucide="truck" className="w-10 h-10 mx-auto mb-2 text-slate-600"></i>
                       <p className="text-sm font-medium">Belum ada riwayat kedatangan barang.</p>
                     </div>
                   ) : (
@@ -8151,8 +8165,8 @@ Daily inventory done✅
                             </div>
                             <div className="flex items-center space-x-2 flex-shrink-0">
                               <button onClick={() => loadKedatanganToActive(item)} className="bg-purple-50 text-purple-700 text-xs font-bold px-2.5 py-1.5 rounded-lg border border-purple-100">Buka</button>
-                              <button onClick={() => handleSendKedatanganToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1.5 rounded-lg border border-sky-100" title="Kirim Telegram"><Icon name="send" className="w-3.5 h-3.5" /></button>
-                              <button onClick={() => handleDeleteKedatangan(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100" title="Hapus"><Icon name="trash-2" className="w-4 h-4" /></button>
+                              <button onClick={() => handleSendKedatanganToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1.5 rounded-lg border border-sky-100" title="Kirim Telegram"><i data-lucide="send" className="w-3.5 h-3.5"></i></button>
+                              <button onClick={() => handleDeleteKedatangan(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100" title="Hapus"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
                             </div>
                           </div>
                         );
@@ -8188,7 +8202,7 @@ Daily inventory done✅
                             onClick={() => setWasteFotoForm({ ...wasteFotoForm, kategori: key })}
                             className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-bold border transition-all ${active ? styles.activeBtn : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
                           >
-                            <Icon name={cat.icon} className="w-4 h-4" />
+                            <i data-lucide={cat.icon} className="w-4 h-4"></i>
                             <span>{cat.short}</span>
                           </button>
                         );
@@ -8233,18 +8247,18 @@ Daily inventory done✅
                           className="absolute -top-2 -right-2 bg-rose-600 text-white rounded-full p-1.5 shadow-md hover:bg-rose-700"
                           title="Hapus foto"
                         >
-                          <Icon name="x" className="w-3.5 h-3.5" />
+                          <i data-lucide="x" className="w-3.5 h-3.5"></i>
                         </button>
                       </div>
                     ) : (
                       <div className="grid grid-cols-2 gap-3">
                         <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
-                          <Icon name="camera" className="w-6 h-6 text-purple-700" />
+                          <i data-lucide="camera" className="w-6 h-6 text-purple-700"></i>
                           <span className="text-xs font-bold text-slate-600">Foto Langsung</span>
                           <input type="file" accept="image/*" capture="environment" onChange={handleWasteFotoFileChange} className="hidden" />
                         </label>
                         <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
-                          <Icon name="image" className="w-6 h-6 text-indigo-700" />
+                          <i data-lucide="image" className="w-6 h-6 text-indigo-700"></i>
                           <span className="text-xs font-bold text-slate-600">Pilih Galeri</span>
                           <input type="file" accept="image/*" onChange={handleWasteFotoFileChange} className="hidden" />
                         </label>
@@ -8252,7 +8266,7 @@ Daily inventory done✅
                     )}
                     {isCompressingFoto && (
                       <p className="text-[11px] text-purple-600 font-semibold mt-2 flex items-center gap-1">
-                        <Icon name="loader" className="w-3.5 h-3.5 animate-spin" /> Mengompres foto...
+                        <i data-lucide="loader" className="w-3.5 h-3.5 animate-spin"></i> Mengompres foto...
                       </p>
                     )}
                   </div>
@@ -8264,7 +8278,7 @@ Daily inventory done✅
                       disabled={isSavingFoto || isCompressingFoto}
                       className="flex-1 bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
                     >
-                      <Icon name={isSavingFoto ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingFoto ? 'animate-spin' : ''}`} />
+                      <i data-lucide={isSavingFoto ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingFoto ? 'animate-spin' : ''}`}></i>
                       <span>{isSavingFoto ? 'Menyimpan...' : 'Simpan ke Riwayat'}</span>
                     </button>
                     <button
@@ -8272,7 +8286,7 @@ Daily inventory done✅
                       disabled={!wasteFotoForm.fotoPreview}
                       className="bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
                     >
-                      <Icon name="send" className="w-4 h-4" />
+                      <i data-lucide="send" className="w-4 h-4"></i>
                       <span>Kirim Telegram</span>
                     </button>
                   </div>
@@ -8291,7 +8305,7 @@ Daily inventory done✅
                       disabled={sendingCategory === 'ALL'}
                       className="bg-indigo-800 hover:bg-indigo-900 disabled:opacity-50 text-white text-xs font-bold px-3 py-2 rounded-lg flex items-center gap-1.5 shadow-sm"
                     >
-                      <Icon name={sendingCategory === 'ALL' ? 'loader' : 'send'} className={`w-3.5 h-3.5 ${sendingCategory === 'ALL' ? 'animate-spin' : ''}`} />
+                      <i data-lucide={sendingCategory === 'ALL' ? 'loader' : 'send'} className={`w-3.5 h-3.5 ${sendingCategory === 'ALL' ? 'animate-spin' : ''}`}></i>
                       <span>Kirim Semua Total</span>
                     </button>
                   </div>
@@ -8302,7 +8316,7 @@ Daily inventory done✅
                       onClick={handleWasteFotoViewYesterday}
                       className="flex items-center gap-1 bg-white border border-slate-200 text-slate-600 text-xs font-bold px-2.5 py-1.5 rounded-lg hover:bg-slate-100"
                     >
-                      <Icon name="chevron-left" className="w-3.5 h-3.5" />
+                      <i data-lucide="chevron-left" className="w-3.5 h-3.5"></i>
                       <span>Hari Sebelumnya</span>
                     </button>
                     <input
@@ -8342,7 +8356,7 @@ Daily inventory done✅
                       <div key={key} className={`rounded-xl border p-4 ${styles.cardBorder} ${styles.cardBg}`}>
                         <div className="flex justify-between items-center mb-3">
                           <div className="flex items-center gap-2">
-                            <Icon name={cat.icon} className={`w-4 h-4 ${styles.icon}`} />
+                            <i data-lucide={cat.icon} className={`w-4 h-4 ${styles.icon}`}></i>
                             <span className="font-bold text-sm text-slate-700">{cat.label}</span>
                             <span className={`text-xs font-black px-2 py-0.5 rounded-md ${styles.badge}`}>
                               Total: {group.total} pcs
@@ -8353,7 +8367,7 @@ Daily inventory done✅
                             disabled={sendingCategory === key || group.items.length === 0}
                             className="bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-white text-[11px] font-bold px-2.5 py-1.5 rounded-lg flex items-center gap-1 shadow-sm"
                           >
-                            <Icon name={sendingCategory === key ? 'loader' : 'send'} className={`w-3 h-3 ${sendingCategory === key ? 'animate-spin' : ''}`} />
+                            <i data-lucide={sendingCategory === key ? 'loader' : 'send'} className={`w-3 h-3 ${sendingCategory === key ? 'animate-spin' : ''}`}></i>
                             <span>Kirim</span>
                           </button>
                         </div>
@@ -8371,10 +8385,10 @@ Daily inventory done✅
                                   <p className="text-[9px] text-slate-600">{formatIndonesianDate(item.tanggal)}</p>
                                   <div className="flex items-center justify-between pt-1">
                                     <button onClick={() => handleSendSingleWasteFotoToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1 rounded-md" title="Kirim ke Telegram">
-                                      <Icon name="send" className="w-3.5 h-3.5" />
+                                      <i data-lucide="send" className="w-3.5 h-3.5"></i>
                                     </button>
                                     <button onClick={() => handleDeleteWasteFoto(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1 rounded-md" title="Hapus">
-                                      <Icon name="trash-2" className="w-3.5 h-3.5" />
+                                      <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
                                     </button>
                                   </div>
                                 </div>
@@ -8394,7 +8408,7 @@ Daily inventory done✅
               <div className="space-y-4">
                 <div>
                   <h2 className="font-bold text-slate-700 text-base flex items-center gap-2">
-                    <Icon name="printer" className="w-4 h-4 text-purple-700" />
+                    <i data-lucide="printer" className="w-4 h-4 text-purple-700"></i>
                     <span>Printing</span>
                   </h2>
                   <p className="text-xs text-slate-500 mt-1">Cetak label Premix atau Catatan Stok. Kompatibel dengan printer biasa maupun printer thermal (58mm/80mm).</p>
@@ -8404,7 +8418,7 @@ Daily inventory done✅
                   <button onClick={() => setPrintingSubTab('premix')} className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all ${printingSubTab === 'premix' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>Premix</button>
                   <button onClick={() => setPrintingSubTab('stock')} className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all ${printingSubTab === 'stock' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>Catatan Stok</button>
                   <button onClick={() => setPrintingSubTab('history')} className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all flex items-center justify-center gap-1 ${printingSubTab === 'history' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>
-                    <Icon name="history" className="w-3.5 h-3.5" />
+                    <i data-lucide="history" className="w-3.5 h-3.5"></i>
                     <span>Riwayat</span>
                   </button>
                 </div>
@@ -8434,7 +8448,7 @@ Daily inventory done✅
                       <input type="text" value={premixForm.asalBahan} onChange={(e) => handlePremixFormChange('asalBahan', e.target.value)} placeholder="Contoh: Gudang Pusat / Dapur Toko" className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" />
                     </div>
                     <button type="submit" className="w-full bg-purple-800 hover:bg-purple-900 text-white font-bold py-3 rounded-xl text-sm flex items-center justify-center gap-2">
-                      <Icon name="printer" className="w-4 h-4" />
+                      <i data-lucide="printer" className="w-4 h-4"></i>
                       <span>Cetak Label Premix</span>
                     </button>
                   </form>
@@ -8460,7 +8474,7 @@ Daily inventory done✅
                         </select>
                       </div>
                       <button type="button" onClick={addStockNoteItem} className="w-full bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-100 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5">
-                        <Icon name="plus" className="w-3.5 h-3.5" />
+                        <i data-lucide="plus" className="w-3.5 h-3.5"></i>
                         <span>Tambah Item</span>
                       </button>
                     </div>
@@ -8474,7 +8488,7 @@ Daily inventory done✅
                               <p className="text-xs text-slate-500">{it.jumlah} {it.satuan}</p>
                             </div>
                             <button onClick={() => removeStockNoteItem(it.id)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100 shrink-0">
-                              <Icon name="trash-2" className="w-3.5 h-3.5" />
+                              <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
                             </button>
                           </div>
                         ))}
@@ -8482,7 +8496,7 @@ Daily inventory done✅
                     )}
 
                     <button onClick={handleStockNotePrint} disabled={stockNoteItems.length === 0} className="w-full bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 rounded-xl text-sm flex items-center justify-center gap-2">
-                      <Icon name="printer" className="w-4 h-4" />
+                      <i data-lucide="printer" className="w-4 h-4"></i>
                       <span>Cetak Catatan Stok</span>
                     </button>
                   </div>
@@ -8493,7 +8507,7 @@ Daily inventory done✅
                   return (
                     <div className="space-y-3">
                       <div className="bg-purple-50 border border-purple-100 rounded-xl px-3 py-2.5 flex items-start gap-2">
-                        <Icon name="smartphone" className="w-3.5 h-3.5 text-purple-700 shrink-0 mt-0.5" />
+                        <i data-lucide="smartphone" className="w-3.5 h-3.5 text-purple-700 shrink-0 mt-0.5"></i>
                         <p className="text-[11px] text-purple-800 leading-relaxed">Riwayat ini tersimpan <b>hanya di perangkat ini</b> (localStorage), tidak dikirim ke server. Kalau ganti HP/browser atau membersihkan data browser, riwayat ini akan hilang.</p>
                       </div>
 
@@ -8508,7 +8522,7 @@ Daily inventory done✅
                             onClick={() => setConfirmClearHistoryType(printHistoryFilter)}
                             className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-100 px-2.5 py-2 rounded-xl"
                           >
-                            <Icon name="trash-2" className="w-3 h-3" />
+                            <i data-lucide="trash-2" className="w-3 h-3"></i>
                             <span>Hapus Semua</span>
                           </button>
                         )}
@@ -8516,7 +8530,7 @@ Daily inventory done✅
 
                       {filteredHistory.length === 0 ? (
                         <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center">
-                          <Icon name="inbox" className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                          <i data-lucide="inbox" className="w-8 h-8 text-slate-300 mx-auto mb-2"></i>
                           <p className="text-xs text-slate-500">Belum ada riwayat cetak{printHistoryFilter !== 'all' ? (printHistoryFilter === 'premix' ? ' Premix' : ' Catatan Stok') : ''}.</p>
                         </div>
                       ) : (
@@ -8551,7 +8565,7 @@ Daily inventory done✅
                                   )}
                                 </div>
                                 <button onClick={() => setConfirmDeleteHistoryId(h.id)} className="shrink-0 text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100">
-                                  <Icon name="trash-2" className="w-3.5 h-3.5" />
+                                  <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
                                 </button>
                               </div>
                             </div>
@@ -8640,14 +8654,14 @@ Daily inventory done✅
                     <p className="text-xs text-slate-500">Kelola riwayat input yang tersinkronisasi di semua HP karyawan.</p>
                   </div>
                   <button onClick={handleExportCSV} className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1 transition-all">
-                    <Icon name="download" className="w-3.5 h-3.5" />
+                    <i data-lucide="download" className="w-3.5 h-3.5"></i>
                     <span>Unduh CSV</span>
                   </button>
                 </div>
 
                 {historyList.length === 0 ? (
                   <div className="text-center py-12 text-slate-600">
-                    <Icon name="history" className="w-12 h-12 mx-auto mb-2 text-slate-600" />
+                    <i data-lucide="history" className="w-12 h-12 mx-auto mb-2 text-slate-600"></i>
                     <p className="text-sm font-medium">Belum ada riwayat tersimpan di Cloud Firebase.</p>
                   </div>
                 ) : (
@@ -8662,7 +8676,7 @@ Daily inventory done✅
                         </div>
                         <div className="flex items-center space-x-2">
                           <button onClick={() => loadHistoryToActive(item)} className="bg-purple-50 text-purple-700 text-xs font-bold px-2.5 py-1.5 rounded-lg border border-purple-100">Buka</button>
-                          <button onClick={() => handleDeleteHistory(item.tanggal)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100"><Icon name="trash-2" className="w-4 h-4" /></button>
+                          <button onClick={() => handleDeleteHistory(item.tanggal)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
                         </div>
                       </div>
                     ))}
@@ -8678,7 +8692,7 @@ Daily inventory done✅
                   <React.Fragment>
                     <div>
                       <h2 className="font-bold text-slate-700 text-base flex items-center gap-2">
-                        <Icon name="book-open" className="w-4 h-4 text-purple-700" />
+                        <i data-lucide="book-open" className="w-4 h-4 text-purple-700"></i>
                         <span>Panduan SOP</span>
                       </h2>
                       <p className="text-xs text-slate-500 mt-1">Pilih kategori untuk melihat langkah-langkah SOP beserta foto/video pendukung.</p>
@@ -8688,14 +8702,14 @@ Daily inventory done✅
                         onClick={() => setShowOnboarding(true)}
                         className="flex-1 flex items-center justify-center gap-2 bg-purple-50 text-purple-700 border border-purple-100 text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-purple-100 transition-all"
                       >
-                        <Icon name="compass" className="w-4 h-4" />
+                        <i data-lucide="compass" className="w-4 h-4"></i>
                         <span>Mulai Tur Panduan Menu</span>
                       </button>
                       <button
                         onClick={() => setShowMandatoryChecklist(true)}
                         className="flex-1 flex items-center justify-center gap-2 bg-rose-50 text-rose-700 border border-rose-100 text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-rose-100 transition-all"
                       >
-                        <Icon name="alert-triangle" className="w-4 h-4" />
+                        <i data-lucide="alert-triangle" className="w-4 h-4"></i>
                         <span>Lihat Hal yang Wajib Diingat</span>
                       </button>
                     </div>
@@ -8707,11 +8721,11 @@ Daily inventory done✅
                           <button key={cat.id} onClick={() => setSelectedSopCategory(cat)} className="text-left bg-white rounded-2xl border border-slate-200 shadow-sm p-4 hover:border-purple-300 hover:shadow-md transition-all">
                             <div className="flex items-center justify-between">
                               <div className="bg-purple-50 text-purple-700 p-2 rounded-lg">
-                                <Icon name="file-text" className="w-4 h-4" />
+                                <i data-lucide="file-text" className="w-4 h-4"></i>
                               </div>
                               {cat.media.length > 0 && (
                                 <span className="text-[10px] bg-slate-100 text-slate-500 font-bold px-1.5 py-0.5 rounded-md flex items-center gap-1">
-                                  <Icon name="image" className="w-3 h-3" />{cat.media.length}
+                                  <i data-lucide="image" className="w-3 h-3"></i>{cat.media.length}
                                 </span>
                               )}
                             </div>
@@ -8725,7 +8739,7 @@ Daily inventory done✅
                 ) : (
                   <React.Fragment>
                     <button onClick={() => setSelectedSopCategory(null)} className="flex items-center gap-1.5 text-purple-700 text-xs font-bold">
-                      <Icon name="arrow-left" className="w-3.5 h-3.5" />
+                      <i data-lucide="arrow-left" className="w-3.5 h-3.5"></i>
                       <span>Kembali ke Panduan SOP</span>
                     </button>
                     <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
@@ -8761,7 +8775,7 @@ Daily inventory done✅
                   <div className="fixed inset-0 z-[95] bg-black/80 flex items-center justify-center p-4 animate-fadeIn" onClick={() => setSopLightboxUrl(null)}>
                     <img src={sopLightboxUrl} className="max-w-full max-h-full rounded-lg animate-scaleIn" />
                     <button onClick={() => setSopLightboxUrl(null)} className="absolute top-4 right-4 bg-white/10 hover:bg-white/20 text-white rounded-full p-2">
-                      <Icon name="x" className="w-5 h-5" />
+                      <i data-lucide="x" className="w-5 h-5"></i>
                     </button>
                   </div>
                 )}
@@ -8882,12 +8896,12 @@ Daily inventory done✅
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col h-[70vh] max-h-[600px]">
           <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
-              <Icon name="message-circle" className="w-4 h-4 text-purple-700 shrink-0" />
+              <i data-lucide="message-circle" className="w-4 h-4 text-purple-700 shrink-0"></i>
               <h3 className="font-bold text-slate-800 text-sm truncate">{title}</h3>
             </div>
             {allowEndSession && messages.length > 0 && (
               <button onClick={() => setConfirmEnd(true)} className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-100 px-2 py-1.5 rounded-lg">
-                <Icon name="rotate-ccw" className="w-3 h-3" /> Akhiri Sesi
+                <i data-lucide="rotate-ccw" className="w-3 h-3"></i> Akhiri Sesi
               </button>
             )}
           </div>
@@ -8918,7 +8932,7 @@ Daily inventory done✅
               className="flex-1 px-3 py-2 border border-slate-300 rounded-xl text-sm min-w-0"
             />
             <button type="submit" disabled={sending || !text.trim()} className="bg-purple-800 disabled:opacity-50 text-white p-2.5 rounded-xl shrink-0">
-              <Icon name="send" className="w-4 h-4" />
+              <i data-lucide="send" className="w-4 h-4"></i>
             </button>
           </form>
 
@@ -8969,7 +8983,7 @@ Daily inventory done✅
             <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
               <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 max-w-sm w-full text-center space-y-3">
                 <div className="w-14 h-14 rounded-full bg-rose-50 flex items-center justify-center mx-auto">
-                  <Icon name="alert-triangle" className="w-7 h-7 text-rose-500" />
+                  <i data-lucide="alert-triangle" className="w-7 h-7 text-rose-500"></i>
                 </div>
                 <h2 className="font-bold text-slate-800 text-lg">Ups, terjadi kendala tampilan</h2>
                 <p className="text-xs text-slate-500">
@@ -8995,10 +9009,8 @@ Daily inventory done✅
       console.error('Tarobun App - Promise ditolak tanpa ditangani:', event.reason);
     });
 
+    // Render AppRoot (menangani login admin/toko, sesi, dan routing)
+
 export default function App() {
-  return (
-    <AppErrorBoundary>
-      <AppRoot />
-    </AppErrorBoundary>
-  );
+  return (<AppErrorBoundary><AppRoot /></AppErrorBoundary>);
 }

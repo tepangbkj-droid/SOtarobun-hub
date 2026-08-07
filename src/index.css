@@ -2,12 +2,11 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ================================================================
-   CATATAN: file ini adalah hasil pemindahan LANGSUNG dari <style>
-   di index.html lama (animasi splash, cetak thermal, dan pengaman
-   layout responsif) -- tidak ada yang diubah isinya.
-   ================================================================ */
-
+/* =====================================================================
+   CSS kustom asli aplikasi (splash screen, animasi, print thermal 58/80mm,
+   pengaman responsif) — DISALIN APA ADANYA dari index.html lama, TIDAK
+   diubah, supaya tampilan & fitur print tetap identik.
+   ===================================================================== */
     /* ========================================== */
     /* PENGAMAN RESPONSIF GLOBAL (2026-07-22) */
     /* Mencegah layar "kepotong"/geser horizontal di HP dengan lebar layar kecil
@@ -207,4 +206,3 @@
       to   { transform: translateX(0); }
     }
     .animate-slideInLeft { animation: tarobunSlideInLeft 0.28s cubic-bezier(0.16, 1, 0.3, 1); }
-  
