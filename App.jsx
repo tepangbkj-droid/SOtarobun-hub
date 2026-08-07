@@ -1,0 +1,9003 @@
+import React, { useState, useEffect } from 'react';
+
+// (useState/useEffect diimpor langsung dari 'react' di bagian atas file ini)
+
+    // ==========================================
+    // KONFIGURASI FIREBASE KELOLAAN ANDA
+    // ==========================================
+    // Ganti object di bawah ini dengan kredibel/config dari console Firebase Anda!
+    // ==========================================
+    // KONEKSI KE CLOUDFLARE WORKER (pengganti Firebase)
+    // ==========================================
+    const WORKER_BASE = import.meta.env.VITE_WORKER_BASE;
+
+    // ==========================================
+    // SEMUA fetch() ke WORKER_BASE WAJIB lewat __apiFetch (bukan fetch() langsung) supaya
+    // credentials: 'include' selalu ikut terkirim -- ini yang membuat Cookie sesi HttpOnly
+    // (lihat catatan KEAMANAN di bawah) benar-benar terkirim & tersimpan, karena WORKER_BASE
+    // adalah origin BERBEDA dari halaman ini (subdomain workers.dev terpisah), dan browser
+    // TIDAK PERNAH mengirim/menyimpan cookie lintas-origin tanpa opsi ini secara eksplisit.
+    // ==========================================
+    const __apiFetch = (url, opts = {}) => fetch(url, { ...opts, credentials: 'include' });
+
+    // ==========================================
+    // KEAMANAN (2026-08): sesi login TIDAK LAGI disimpan sebagai token di localStorage.
+    // Sebelumnya token autentikasi disimpan mentah-mentah di localStorage (CF_SESSION_KEY),
+    // yang artinya SEMUA script di halaman ini -- termasuk script asing yang berhasil
+    // disuntikkan lewat celah XSS mana pun -- bisa membaca token itu dan membajak sesi
+    // login. Sekarang Cloudflare Worker mengirim sesi lewat Set-Cookie HttpOnly (lihat
+    // buildSessionCookie di worker.js): cookie itu TIDAK PERNAH bisa dibaca oleh
+    // document.cookie atau JavaScript apa pun, hanya otomatis dikirim browser ke Worker.
+    // Konsekuensinya: frontend ini juga TIDAK LAGI tahu isi/nilai token-nya sendiri -- utk
+    // mengetahui "apakah user ini sedang login", frontend bertanya ke server lewat endpoint
+    // GET /api/session/me (lihat __loadCfSession di bawah), bukan membaca localStorage.
+    let __authListeners = [];
+    // __authHeaders() sengaja jadi no-op (dipertahankan sebagai fungsi kosong, bukan
+    // dihapus) supaya SEMUA titik fetch() lama di file ini yang masih menulis
+    // `...__authHeaders()` tetap berjalan tanpa perlu diubah satu-persatu -- otentikasi
+    // sekarang murni lewat Cookie (otomatis via __apiFetch), bukan header lagi.
+    const __authHeaders = () => ({});
+
+    // ==========================================
+    // IDENTITAS DEVICE -- HANYA LABEL KOSMETIK, BUKAN LAGI KONTROL KEAMANAN
+    // ==========================================
+    // PENTING (2026-08): deviceId acak di bawah ini (disimpan di localStorage) DULU dipakai
+    // Worker untuk menentukan identitas device demi pembatasan sesi -- ini rapuh, karena
+    // klien mana pun bebas membaca/mengubah/memalsukan nilai localStorage-nya sendiri untuk
+    // mengaku-aku sebagai device lain atau menghindari pembatasan. Sekarang identitas device
+    // yang MENENTUKAN HAK AKSES (`sid`) dibuat & ditandatangani di SERVER saat login (lihat
+    // /api/login/store di worker.js), lalu ikut di dalam Cookie sesi -- client tidak bisa
+    // menyentuhnya sama sekali. Variabel deviceId di bawah ini yang tersisa HANYA dipakai
+    // sebagai label kosmetik (mis. dikirim sebagai deviceLabel saat login, supaya Admin bisa
+    // melihat "Chrome - Android" dsb di menu Perangkat) -- memalsukannya tidak memberi
+    // keuntungan keamanan apa pun ke penyerang.
+    const DEVICE_ID_KEY = 'tarobun_device_id';
+    const getDeviceId = () => {
+      try {
+        let id = localStorage.getItem(DEVICE_ID_KEY);
+        if (!id) {
+          id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('dev-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+          localStorage.setItem(DEVICE_ID_KEY, id);
+        }
+        return id;
+      } catch (e) {
+        return 'dev-' + Date.now();
+      }
+    };
+
+    // Label device yang gampang dikenali manusia (dipakai Admin di menu "Perangkat" supaya
+    // bisa membedakan mana device yang dikenali vs asing), disusun dari user agent browser.
+    // Bukan identitas presisi (hanya perkiraan browser + OS), tapi cukup untuk pengecekan
+    // sekilas ("oh ini HP kasir", "ini laptop yang tidak dikenal", dsb).
+    const getDeviceLabel = () => {
+      try {
+        const ua = navigator.userAgent || '';
+        let os = 'Unknown OS';
+        if (/Android/i.test(ua)) os = 'Android';
+        else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS';
+        else if (/Windows/i.test(ua)) os = 'Windows';
+        else if (/Mac OS X/i.test(ua)) os = 'macOS';
+        else if (/Linux/i.test(ua)) os = 'Linux';
+        let browser = 'Browser';
+        if (/Edg\//i.test(ua)) browser = 'Edge';
+        else if (/Chrome\//i.test(ua) && !/OPR\//i.test(ua)) browser = 'Chrome';
+        else if (/Firefox\//i.test(ua)) browser = 'Firefox';
+        else if (/Safari\//i.test(ua) && !/Chrome\//i.test(ua)) browser = 'Safari';
+        else if (/OPR\//i.test(ua)) browser = 'Opera';
+        return `${browser} - ${os}`;
+      } catch (e) {
+        return 'Perangkat tidak dikenal';
+      }
+    };
+
+    // Menggantikan __loadCfSession lama (yang membaca token dari localStorage): sekarang
+    // bertanya LANGSUNG ke server lewat Cookie HttpOnly (otomatis terkirim oleh __apiFetch),
+    // karena JavaScript di sini tidak pernah bisa membaca isi cookie sesi itu sendiri.
+    // Mengembalikan null kalau tidak ada sesi valid (belum login / cookie kedaluwarsa/dihapus).
+    const __fetchServerSession = async () => {
+      try {
+        const res = await __apiFetch(`${WORKER_BASE}/api/session/me`, { cache: 'no-store' });
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (!data || !data.ok) return null;
+        if (data.role === 'admin') return { uid: data.uid, role: 'admin' };
+        return { storeId: data.storeId, role: 'store', storeInfo: data.storeInfo };
+      } catch (e) {
+        return null;
+      }
+    };
+
+    const __makeSnapshot = (value) => ({
+      val: () => (value === undefined ? null : value),
+      exists: () => value !== null && value !== undefined,
+      forEach: (cb) => { if (value && typeof value === 'object') Object.keys(value).forEach(k => cb(__makeSnapshot(value[k]))); },
+      key: null,
+    });
+
+    // Ambil isi body response error (JSON {error,stack} dari worker, atau teks polos) supaya
+    // pesan error ASLI dari server ikut naik ke UI — sebelumnya set/update/push cuma melempar
+    // "HTTP 500" tanpa detail, beda dengan doFetch (GET) yang sudah menyertakan body-nya.
+    const __readErrorBody = async (res) => {
+      let bodyText = '';
+      try {
+        const data = await res.json();
+        bodyText = data && data.error ? data.error : JSON.stringify(data);
+      } catch (e) {
+        try { bodyText = await res.text(); } catch (e2) {}
+      }
+      return 'HTTP ' + res.status + (bodyText ? (': ' + String(bodyText).slice(0, 300)) : '');
+    };
+    // Bungkus fetch supaya error jaringan (server tidak terjangkau sama sekali) dan error HTTP
+    // (status bukan 2xx) sama-sama menghasilkan pesan yang jelas, bukan "HTTP 500" polos.
+    const __fetchOrThrow = async (url, opts) => {
+      let res;
+      try {
+        res = await __apiFetch(url, opts);
+      } catch (netErr) {
+        throw new Error('Tidak bisa menghubungi server (' + (netErr && netErr.message ? netErr.message : 'jaringan gagal') + ')');
+      }
+      if (!res.ok) throw new Error(await __readErrorBody(res));
+      return res;
+    };
+
+    // OPTIMASI BESAR (2026-07-19): sebelumnya SETIAP listener .on('value', ...) di app ini
+    // (riwayat, chat, waste, katalog, storeDirectory, dst — ada ~19 titik) polling
+    // GET ke Worker/D1 tiap 4 DETIK, TERUS-MENERUS selama halaman terbuka. Dengan banyak
+    // listener aktif bersamaan per sesi (toko/admin bisa punya 6-8 sekaligus), 1 toko saja
+    // bisa menghasilkan puluhan ribu Rows Read/hari — dikali 100 toko, ini JAUH melewati
+    // limit gratis 5 juta Rows Read/hari D1. Diperlambat jadi 15 detik (masih terasa "live"
+    // untuk dashboard toko/kasir, bukan aplikasi trading), DAN di-skip total selagi
+    // tab/app di-background (user tidak sedang melihatnya) — kombinasi keduanya memangkas
+    // total Rows Read sistem secara drastis tanpa mengubah pengalaman pengguna yang terlihat.
+    const LIVE_POLL_INTERVAL_MS = 25000;
+
+    // ===== CHAT REALTIME (2026-07-20) — HTTP long-polling, SENGAJA BUKAN WebSocket =====
+    // WebSocket sering diblokir/diputus oleh proxy kantor/sekolah atau operator seluler
+    // tertentu (banyak yang menolak/mem-buang request "Connection: Upgrade"), jadi kalau
+    // dipaksa pakai WS, chat bisa malah TIDAK JALAN SAMA SEKALI di jaringan seperti itu.
+    // Long-polling di bawah ini murni request GET biasa (persis seperti fetch() lain di
+    // app ini) — dari sudut pandang proxy/firewall manapun TIDAK ADA BEDANYA dengan
+    // request API biasa, cuma "dibalas belakangan" oleh server (lihat /api/chat/wait di
+    // worker.js). Begitu server ada kabar baru, request langsung dibalas SAAT ITU JUGA,
+    // lalu kode di bawah langsung buka request berikutnya tanpa jeda — hasilnya terasa
+    // real-time walau bukan WebSocket.
+    //
+    // storeId: null/undefined = pantau SEMUA toko sekaligus (dipakai Admin untuk badge
+    //          unread di halaman daftar chat). Diisi storeId = pantau 1 toko spesifik
+    //          (dipakai toko untuk chat-nya sendiri, dan Admin saat sedang buka 1 jendela
+    //          chat toko tertentu).
+    // onChange({ event, storeId, version }) dipanggil setiap ada pesan baru.
+    //
+    // FALLBACK OTOMATIS: kalau long-poll gagal berturut-turut (mis. ada jaringan yang
+    // ternyata tetap memotong koneksi HTTP yang "digantung" lama, walau itu jarang),
+    // otomatis mundur ke jeda LIVE_POLL_INTERVAL_MS antar percobaan — jadi paling buruk
+    // perilakunya sama seperti polling lama (15 detik), TIDAK PERNAH membuat chat berhenti
+    // total.
+    function createChatLongPoll({ storeId, onChange }) {
+      let stopped = false;
+      let version = 0;
+      let consecutiveErrors = 0;
+      const FALLBACK_AFTER = 3;
+
+      const loop = async () => {
+        if (stopped) return;
+        let timeoutId;
+        try {
+          const qs = storeId ? `storeId=${encodeURIComponent(storeId)}&v=${version}` : `v=${version}`;
+          const controller = new AbortController();
+          // Sedikit lebih lama dari WAIT_TIMEOUT_MS di server (30 detik), supaya browser
+          // yang membatalkan request bukan karena server-nya lambat balas.
+          timeoutId = setTimeout(() => controller.abort(), 40000);
+          const res = await __apiFetch(`${WORKER_BASE}/api/chat/wait?${qs}`, { headers: __authHeaders(), signal: controller.signal });
+          clearTimeout(timeoutId);
+          const data = await res.json();
+          consecutiveErrors = 0;
+          if (data && typeof data.version === 'number') version = data.version;
+          if (data && data.changed) onChange(data);
+        } catch (e) {
+          consecutiveErrors++;
+        } finally {
+          clearTimeout(timeoutId);
+          if (!stopped) {
+            // Sukses (berubah ATAU timeout kosong dari server) -> langsung sambung lagi
+            // TANPA jeda. Gagal (network error) -> mundur sebentar dulu, makin lama makin
+            // jarang kalau terus gagal, sampai akhirnya "menyerah" ke jeda polling biasa.
+            const delay = consecutiveErrors === 0 ? 0
+              : consecutiveErrors >= FALLBACK_AFTER ? LIVE_POLL_INTERVAL_MS
+              : 1000 * consecutiveErrors;
+            setTimeout(loop, delay);
+          }
+        }
+      };
+      loop();
+      return { stop: () => { stopped = true; } };
+    }
+
+    // ===== TAMBAHAN: CACHE LOKAL BROWSER (IndexedDB) + VERSION-CHECK MURAH (2026-07-25) =====
+    // Ide (dari diskusi): jangan tarik ulang data penuh dari server tiap 25 detik kalau tidak
+    // ada perubahan. Sebelum fetch data penuh (yang mahal, baca D1), tanya dulu "versi" ke
+    // server (murah, cuma baca Durable Object di memori, 0 Rows Read D1 — lihat endpoint
+    // /api/data-version di worker.js). Kalau versi sama seperti terakhir diketahui, pakai
+    // data yang sudah tersimpan di IndexedDB — TIDAK sentuh D1 sama sekali. Kalau beda, baru
+    // fetch data penuh, lalu simpan lagi ke IndexedDB untuk dipakai nanti (termasuk setelah
+    // reload halaman/buka app lagi).
+    //
+    // PENTING soal Rows WRITTEN: cache ini HANYA membantu sisi BACA. Setiap kali admin/toko
+    // betulan MENGUBAH data, penulisan ke D1 tetap terjadi seperti biasa — cache ini tidak
+    // (dan tidak bisa) mengurangi Rows Written.
+    const IDB_NAME = 'tarobun-cache-v1';
+    const IDB_STORE = 'kv';
+    function idbOpen() {
+      return new Promise((resolve, reject) => {
+        if (typeof indexedDB === 'undefined') { reject(new Error('IndexedDB tidak tersedia')); return; }
+        const req = indexedDB.open(IDB_NAME, 1);
+        req.onupgradeneeded = () => { req.result.createObjectStore(IDB_STORE); };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+    async function idbGet(key) {
+      try {
+        const db = await idbOpen();
+        return await new Promise((resolve, reject) => {
+          const tx = db.transaction(IDB_STORE, 'readonly');
+          const req = tx.objectStore(IDB_STORE).get(key);
+          req.onsuccess = () => resolve(req.result === undefined ? null : req.result);
+          req.onerror = () => reject(req.error);
+        });
+      } catch (e) { return null; } // gagal buka IndexedDB (mis. mode private ketat) -> anggap tidak ada cache
+    }
+    async function idbSet(key, value) {
+      try {
+        const db = await idbOpen();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(IDB_STORE, 'readwrite');
+          tx.objectStore(IDB_STORE).put(value, key);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      } catch (e) { /* diamkan; ini cuma optimisasi, bukan sumber data utama */ }
+    }
+
+    // Granularitas versi HARUS SAMA PERSIS dengan versionKeyForPath di worker.js: per-toko
+    // + per-sub-koleksi (mis. `stores/<id>/history` terpisah dari `stores/<id>/preOrders`)
+    // supaya perubahan di 1 sub-koleksi tidak memicu refetch sub-koleksi lain yang tidak
+    // berhubungan, atau per-top-level-key untuk path lain.
+    function versionKeyForPath(rawPath) {
+      const parts = String(rawPath || '').replace(/^\/+|\/+$/g, '').split('/');
+      if (parts[0] === 'stores' && parts[1]) return parts[2] ? `stores/${parts[1]}/${parts[2]}` : `stores/${parts[1]}`;
+      return parts[0] || 'root';
+    }
+
+    // Registry semua listener aktif yang butuh version-check, dipakai OLEH SATU poller
+    // bersama (bukan 1 request /api/data-version per listener) — supaya kalau 1 layar
+    // punya 5 listener sekaligus (history, wasteFotos, preOrders, dst), itu tetap cuma
+    // 1 request per siklus, bukan 5.
+    const __versionListeners = new Map(); // versionKey -> Set(handler(v))
+    let __versionPollStarted = false;
+    function __registerVersionListener(versionKey, handler) {
+      if (!__versionListeners.has(versionKey)) __versionListeners.set(versionKey, new Set());
+      __versionListeners.get(versionKey).add(handler);
+      __startVersionPollerOnce();
+      return () => {
+        const set = __versionListeners.get(versionKey);
+        if (set) { set.delete(handler); if (set.size === 0) __versionListeners.delete(versionKey); }
+      };
+    }
+    function __startVersionPollerOnce() {
+      if (__versionPollStarted) return;
+      __versionPollStarted = true;
+      const tick = async () => {
+        try {
+          if (!(typeof document !== 'undefined' && document.hidden) && __versionListeners.size > 0) {
+            const keys = [...__versionListeners.keys()];
+            const res = await __apiFetch(`${WORKER_BASE}/api/data-version?keys=${encodeURIComponent(keys.join(','))}`, { headers: __authHeaders() });
+            const data = await res.json();
+            const versions = (data && data.versions) || {};
+            for (const key of keys) {
+              const handlers = __versionListeners.get(key);
+              if (!handlers) continue;
+              const v = versions[key] || 0;
+              for (const h of [...handlers]) h(v);
+            }
+          }
+        } catch (e) { /* gagal 1 siklus tidak fatal, listener individu ada jaring pengaman sendiri */ }
+        setTimeout(tick, LIVE_POLL_INTERVAL_MS);
+      };
+      tick();
+    }
+
+    function dbRef(rawPath) {
+      const cleanPath = String(rawPath || '').replace(/^\/+|\/+$/g, '');
+      const doFetch = async (p, rawRowLimit) => {
+        const qs = rawRowLimit ? `&limit=${encodeURIComponent(rawRowLimit)}` : '';
+        // BUGFIX (2026-07-20): endpoint ini (khususnya 'storeDirectory' & katalog produk)
+        // dibalas server dengan header Cache-Control: public, max-age=300 supaya Cloudflare
+        // edge cache hemat baca D1. Masalahnya header itu juga otomatis dipatuhi oleh cache
+        // HTTP bawaan BROWSER pengguna sendiri — jadi walau server sudah membersihkan cache
+        // edge-nya begitu Admin membuat toko baru (lihat purgeDerivedCachesIfNeeded di
+        // worker.js), browser Admin/Toko yang sama tetap bisa menyajikan data LAMA dari cache
+        // lokalnya sendiri sampai 5 menit tanpa sempat menyentuh jaringan sama sekali. Inilah
+        // penyebab keluhan "toko baru dibuat, datanya lama sekali muncul/loading". Fix: paksa
+        // fetch ini SELALU tembus ke jaringan (cache: 'no-store') supaya browser tidak pernah
+        // menyajikan jawaban basi miliknya sendiri — permintaan tetap ringan buat server karena
+        // edge cache Cloudflare (di sisi server) masih tetap jalan seperti biasa.
+        const res = await __fetchOrThrow(`${WORKER_BASE}/api/rtdb/get?path=${encodeURIComponent(p)}${qs}`, { headers: __authHeaders(), cache: 'no-store' });
+        const data = await res.json();
+        return data.value;
+      };
+      const refObj = {
+        path: cleanPath,
+        toString: () => cleanPath,
+        child: (sub) => dbRef(cleanPath + '/' + sub),
+        set: async (value) => {
+          const res = await __fetchOrThrow(`${WORKER_BASE}/api/rtdb/set`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ path: cleanPath, value }),
+          });
+          return res.json();
+        },
+        update: async (updates) => {
+          const full = {};
+          for (const [k, v] of Object.entries(updates)) full[(cleanPath ? cleanPath + '/' : '') + k] = v;
+          const res = await __fetchOrThrow(`${WORKER_BASE}/api/rtdb/update`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ updates: full }),
+          });
+          return res.json();
+        },
+        push: async (value) => {
+          const res = await __fetchOrThrow(`${WORKER_BASE}/api/rtdb/push`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ path: cleanPath, value }),
+          });
+          const data = await res.json();
+          return dbRef(cleanPath + '/' + data.name);
+        },
+        remove: async () => refObj.set(null),
+        once: async () => __makeSnapshot(await doFetch(cleanPath)),
+        // ===== DIUBAH (2026-07-25): dari polling buta tiap 25 detik -> version-check dulu =====
+        // Dulu: tiap 25 detik SELALU fetch data penuh ke server (selalu sentuh D1), walau
+        // datanya persis sama seperti 25 detik lalu.
+        // Sekarang: cache lokal (IndexedDB) ditampilkan dulu (instan, 0 network) sambil
+        // nunggu; lalu tiap siklus, cuma tanya VERSI (murah, 0 D1) lewat poller bersama.
+        // Data penuh (yang sentuh D1) HANYA di-fetch kalau versinya benar-benar berubah.
+        on: (eventType, cb, errCb) => {
+          let stopped = false;
+          let lastVersion = -1;
+          const versionKey = versionKeyForPath(cleanPath);
+          const idbKey = `on:${cleanPath}`;
+
+          const runFetch = async () => {
+            try {
+              const value = await doFetch(cleanPath);
+              if (!stopped) cb(__makeSnapshot(value));
+              idbSet(idbKey, value);
+            } catch (e) { if (errCb) errCb(e); }
+          };
+
+          // Tampilkan cache lokal DULU (kalau ada) supaya UI langsung terisi tanpa nunggu
+          // jaringan sama sekali — nanti dikonfirmasi/diperbarui begitu version-check
+          // pertama selesai (atau tetap sama kalau memang belum ada perubahan).
+          (async () => {
+            const cached = await idbGet(idbKey);
+            if (cached !== null && !stopped) cb(__makeSnapshot(cached));
+          })();
+
+          const unregister = __registerVersionListener(versionKey, (v) => {
+            if (stopped) return;
+            if (v !== lastVersion) { lastVersion = v; runFetch(); }
+          });
+
+          // Jaring pengaman: kalau tab di-background lama lalu aktif lagi, atau Durable
+          // Object kebetulan restart (versi reset), tetap ada refresh berkala JARANG (6x
+          // lipat interval biasa, jadi tidak menambah beban D1 secara berarti) supaya data
+          // tidak pernah "macet" walau version-check gagal terus-menerus.
+          const safety = setInterval(() => {
+            if (!stopped && !(typeof document !== 'undefined' && document.hidden)) runFetch();
+          }, LIVE_POLL_INTERVAL_MS * 6);
+
+          cb.__stop = () => { stopped = true; unregister(); clearInterval(safety); };
+          return cb;
+        },
+        off: (eventType, cb) => { if (cb && cb.__stop) cb.__stop(); },
+        limitToLast: (n) => {
+          // BUGFIX (2026-07-19): sebelumnya ini KOSMETIK — server tetap kirim SELURUH isi
+          // node, baru dipotong ke N di HP. Sekarang beneran dibatasi di server lewat
+          // ?limit=. Karena 1 "record" logis bisa tersebar ke beberapa baris D1 (lihat
+          // rtdbReadPathLimited di worker.js), dipakai faktor aman 15x supaya record
+          // ber-field banyak (mis. riwayat penjualan dengan rincian item) tetap tercakup
+          // penuh. Dibatasi maksimal 3000 baris mentah supaya tetap ada plafon jelas.
+          const rawRowLimit = Math.min(n * 15, 3000);
+          const limitedFetch = (p) => doFetch(p, rawRowLimit);
+          const trimToN = (value) => {
+            // Jaring pengaman tambahan: kalau raw-row-limit di atas kebetulan masih
+            // menyisakan sedikit lebih dari N record, tetap dipotong ke N di HP juga,
+            // supaya perilaku yang terlihat oleh user identik seperti sebelumnya.
+            if (!value || typeof value !== 'object') return value;
+            const keys = Object.keys(value).sort();
+            if (keys.length <= n) return value;
+            const out = {};
+            keys.slice(-n).forEach(k => out[k] = value[k]);
+            return out;
+          };
+          return {
+            once: async () => __makeSnapshot(trimToN(await limitedFetch(cleanPath))),
+            // Sama seperti refObj.on() di atas: version-check dulu (murah, 0 D1), baru
+            // fetch data penuh (limitedFetch, yang sentuh D1) kalau memang ada perubahan.
+            on: (eventType, cb, errCb) => {
+              let stopped = false;
+              let lastVersion = -1;
+              const versionKey = versionKeyForPath(cleanPath);
+              const idbKey = `on-limit:${cleanPath}:${n}`;
+
+              const runFetch = async () => {
+                try {
+                  const value = await limitedFetch(cleanPath);
+                  const trimmed = trimToN(value);
+                  if (!stopped) cb(__makeSnapshot(trimmed));
+                  idbSet(idbKey, trimmed);
+                } catch (e) { if (errCb) errCb(e); }
+              };
+
+              (async () => {
+                const cached = await idbGet(idbKey);
+                if (cached !== null && !stopped) cb(__makeSnapshot(cached));
+              })();
+
+              const unregister = __registerVersionListener(versionKey, (v) => {
+                if (stopped) return;
+                if (v !== lastVersion) { lastVersion = v; runFetch(); }
+              });
+
+              const safety = setInterval(() => {
+                if (!stopped && !(typeof document !== 'undefined' && document.hidden)) runFetch();
+              }, LIVE_POLL_INTERVAL_MS * 6);
+
+              cb.__stop = () => { stopped = true; unregister(); clearInterval(safety); };
+              return cb;
+            },
+            off: (eventType, cb) => { if (cb && cb.__stop) cb.__stop(); },
+          };
+        },
+      };
+      return refObj;
+    }
+
+    const db = { ref: dbRef };
+
+    // ==========================================
+    // MEDIA (FOTO) DI R2 — pengganti simpan base64 langsung di database
+    // ==========================================
+    // Ubah data URI base64 (mis. hasil canvas.toDataURL) menjadi Blob biner, supaya bisa
+    // dikirim sebagai body upload (bukan teks JSON raksasa).
+    const dataUrlToBlob = (dataUrl) => {
+      const [header, base64] = String(dataUrl || '').split(',');
+      const mimeMatch = /data:([^;]+);base64/.exec(header || '');
+      const contentType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+      const binary = atob(base64 || '');
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return new Blob([bytes], { type: contentType });
+    };
+
+    // Upload satu blob/foto ke R2 lewat Worker. `folder` dipakai sebagai prefix key (mis.
+    // "wasteFotos/{storeId}") supaya rapi dan gampang ditelusuri. Balikannya { url, key } —
+    // `url` langsung dipakai sebagai <img src>, `key` disimpan di database untuk keperluan hapus nanti.
+    const uploadMediaToR2 = async (dataUrlOrBlob, folder, ext = 'jpg') => {
+      const blob = dataUrlOrBlob instanceof Blob ? dataUrlOrBlob : dataUrlToBlob(dataUrlOrBlob);
+      const res = await __apiFetch(`${WORKER_BASE}/api/media/upload?folder=${encodeURIComponent(folder)}&ext=${encodeURIComponent(ext)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': blob.type || 'application/octet-stream', ...__authHeaders() },
+        body: blob,
+      });
+      if (!res.ok) throw new Error('Gagal upload foto ke storage (HTTP ' + res.status + ')');
+      const data = await res.json();
+      return { key: data.key, url: `${WORKER_BASE}/api/media/file/${data.key}` };
+    };
+
+    // Hapus satu atau beberapa key sekaligus dari R2. Sengaja "best-effort" (tidak melempar error
+    // ke pemanggil) supaya kegagalan hapus file lama tidak sampai mem-block penghapusan data di DB —
+    // file yang gagal terhapus di R2 tidak akan pernah terlihat lagi oleh siapapun karena reference-nya
+    // di database sudah hilang, jadi paling buruk cuma "sampah" kecil, bukan bug yang mengganggu user.
+    const deleteMediaFromR2 = async (keyOrKeys) => {
+      const keys = Array.isArray(keyOrKeys) ? keyOrKeys.filter(Boolean) : [keyOrKeys].filter(Boolean);
+      if (keys.length === 0) return;
+      try {
+        await __apiFetch(`${WORKER_BASE}/api/media/delete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+          body: JSON.stringify({ keys }),
+        });
+      } catch (e) {
+        console.warn('Gagal hapus file di R2 (diabaikan, tidak mem-block penghapusan data):', e);
+      }
+    };
+
+    // getIdToken() dipertahankan sebagai stub kosong (bukan dihapus) untuk kompatibilitas
+    // kalau ada pemanggil lama -- tapi TIDAK PERNAH lagi mengembalikan token asli, karena
+    // token sesi sekarang hanya ada di Cookie HttpOnly yang memang sengaja tidak bisa dibaca
+    // dari JavaScript sama sekali (itulah intinya, lihat catatan KEAMANAN di atas).
+    const __makeUser = (u) => u ? { uid: u.uid || u.storeId, ...u, getIdToken: async () => null } : null;
+
+    const auth = {
+      currentUser: null,
+      setPersistence: async () => {},
+      onAuthStateChanged: (cb) => {
+        // Async: mengecek sesi ke server (lihat __fetchServerSession) alih-alih membaca
+        // localStorage secara instan, karena kebenaran sesi sekarang murni ada di server/cookie.
+        (async () => {
+          const savedUser = await __fetchServerSession();
+          auth.currentUser = __makeUser(savedUser);
+          cb(auth.currentUser);
+        })();
+        __authListeners.push(cb);
+        return () => { __authListeners = __authListeners.filter(l => l !== cb); };
+      },
+      signInWithEmailAndPassword: async (email, password) => {
+        let res, data;
+        if (email === 'admin@tarobun-app.internal') {
+          res = await __apiFetch(`${WORKER_BASE}/api/login/admin`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password }),
+          });
+          data = await res.json();
+          if (!res.ok) { const e = new Error(data.error || 'Login gagal'); e.status = res.status; throw e; }
+          // Tidak ada lagi token untuk disimpan di sini -- Worker sudah mengirimkannya lewat
+          // Set-Cookie HttpOnly pada response ini (browser menyimpannya otomatis).
+          auth.currentUser = __makeUser({ uid: data.uid, role: 'admin' });
+          return { user: auth.currentUser };
+        } else {
+          const storeId = email.replace(/^store-/, '').replace(/@toko\.tarobun-app\.internal$/, '');
+          // deviceId TIDAK dikirim lagi -- server yang membuat & menandatangani identitas
+          // device (sid) sendiri saat login (lihat catatan di /api/login/store, worker.js).
+          // deviceLabel tetap dikirim, tapi murni label tampilan kosmetik untuk menu Admin.
+          res = await __apiFetch(`${WORKER_BASE}/api/login/store`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ storeId, token: password, deviceLabel: getDeviceLabel() }),
+          });
+          data = await res.json();
+          if (!res.ok) { const e = new Error(data.error || 'Login gagal'); e.status = res.status; throw e; }
+          auth.currentUser = __makeUser({ storeId: data.storeId, role: 'store' });
+          return { user: auth.currentUser, storeInfo: data.storeInfo };
+        }
+      },
+      createUserWithEmailAndPassword: async (email, password) => {
+        const res = await __apiFetch(`${WORKER_BASE}/api/bootstrap-admin`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Gagal membuat admin');
+        auth.currentUser = __makeUser({ uid: data.uid, role: 'admin' });
+        return { user: auth.currentUser };
+      },
+      signOut: async () => {
+        // Cookie HttpOnly tidak bisa dihapus dari JavaScript -- WAJIB minta server yang
+        // menghapusnya lewat Set-Cookie (lihat /api/logout di worker.js).
+        try { await __apiFetch(`${WORKER_BASE}/api/logout`, { method: 'POST' }); } catch (e) {}
+        auth.currentUser = null;
+      },
+    };
+
+    // Dipakai khusus admin membuat akun toko baru (dulu perlu "instance kedua" Firebase supaya
+    // sesi admin tidak ikut ke-replace; di sistem baru tidak perlu akun Auth terpisah untuk toko —
+    // token toko cukup disimpan di data, jadi ini cukup jadi stub ringan).
+    const secondaryAuth = {
+      createUserWithEmailAndPassword: async (email, password) => ({ user: { uid: crypto.randomUUID() } }),
+      signOut: async () => {},
+    };
+
+    const storage = { ref: () => ({}) }; // tidak dipakai (foto disimpan sebagai base64 di data, bukan Storage)
+
+    const firebase = {
+      database: { ServerValue: { TIMESTAMP: '.sv_timestamp' } },
+    };
+
+    // ==========================================
+    // KONSTANTA & UTILITAS AUTENTIKASI MULTI-TOKO
+    // ==========================================
+    const ADMIN_EMAIL = 'admin@tarobun-app.internal';
+    const STORE_EMAIL_DOMAIN = '@toko.tarobun-app.internal';
+    const SESSION_KEY = 'tarobun_session_v2';
+    const SESSION_DURATION_MS = 24.5 * 60 * 60 * 1000; // 24 jam 30 menit sesuai permintaan
+
+    // ==========================================
+    // KONSTANTA PRESENCE (status online/offline toko)
+    // ==========================================
+    // Didesain TANPA bergantung pada koneksi WebSocket yang tetap terbuka
+    // (mis. .info/connected + onDisconnect() bawaan Firebase). Di banyak jaringan
+    // seluler, koneksi WebSocket ke Firebase suka lambat/diblokir/putus-nyambung,
+    // sehingga status toko sering "nyangkut" Offline padahal toko sedang login &
+    // aktif — inilah penyebab bug yang dilaporkan. Solusinya: toko mengirim
+    // HEARTBEAT lewat HTTPS biasa (REST, sama seperti restSet lain di app ini)
+    // tiap PRESENCE_HEARTBEAT_MS, dan Admin menganggap toko online selama
+    // heartbeat terakhirnya masih "segar" (kurang dari PRESENCE_ONLINE_TIMEOUT_MS
+    // yang lalu). Kalau toko menutup tab/koneksi putus mendadak, heartbeat
+    // otomatis berhenti dan Admin akan melihatnya berubah jadi Offline sendiri
+    // begitu heartbeat terakhir kedaluwarsa — tanpa perlu event "disconnect" apa pun.
+    // OPTIMASI (2026-07-18, dipercepat lagi 2026-07-20): presence 100% lewat Durable Object
+    // (memori, 0 biaya D1 Rows Written), jadi heartbeat boleh sesering apa pun tanpa numpang
+    // limit D1 sama sekali — TIDAK ada alasan lagi membuatnya lambat.
+    // BUGFIX (2026-07-20): timeout offline sebelumnya 120 detik, terasa lambat ("tidak
+    // real-time") bagi Admin saat memantau status ON/OFF toko. Dipercepat jadi heartbeat 10
+    // detik + timeout 35 detik (3.5x interval — masih ada toleransi untuk throttling timer di
+    // HP saat layar dikunci/app di-background, tapi status berubah jauh lebih cepat
+    // dibanding sebelumnya). Heartbeat ini SEKALIGUS dipakai server untuk mengecek limit
+    // device & auto-logout tidak aktif (lihat sendHeartbeat di StoreApp) — jadi
+    // mempercepat interval ini juga mempercepat deteksi "device ditendang/logout paksa".
+    const PRESENCE_HEARTBEAT_MS = 10 * 1000;       // toko lapor "online" tiap 10 detik
+    const PRESENCE_ONLINE_TIMEOUT_MS = 35 * 1000;  // dianggap offline kalau tak ada kabar > 35 detik
+
+    const storeIdToEmail = (storeId) => `store-${storeId}${STORE_EMAIL_DOMAIN}`;
+
+    // Menghasilkan token acak yang kuat secara kriptografis (dipakai sebagai "password" toko)
+    const generateSecureToken = (length = 16) => {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+      const bytes = new Uint32Array(length);
+      window.crypto.getRandomValues(bytes);
+      let out = '';
+      for (let i = 0; i < length; i++) out += chars[bytes[i] % chars.length];
+      return out;
+    };
+
+    const slugify = (str) => str.toString().toLowerCase().trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '')
+      .slice(0, 40);
+
+    // KEAMANAN (2026-08): pembatasan percobaan login (anti brute-force) yang DULU ada di sini
+    // (disimpan & dihitung di localStorage) sudah DIHAPUS TOTAL dari frontend. LocalStorage
+    // sepenuhnya dikuasai & bisa diubah bebas oleh siapa pun yang memakai browser tsb (lewat
+    // DevTools, extension, atau script apa pun) -- artinya batasan itu SAMA SEKALI TIDAK
+    // melindungi apa pun, hanya ilusi keamanan di sisi tampilan. Pembatasan yang SUNGGUHAN
+    // sekarang 100% berjalan di Cloudflare Worker (lihat loginGuardCheck/Fail/Success di
+    // worker.js, disimpan di Durable Object -- tidak bisa disentuh/dilewati oleh client sama
+    // sekali): 5x salah dalam 15 menit per akun DAN per alamat IP akan dikunci otomatis, dan
+    // server membalas status 429 dengan pesan sisa waktu kunci -- lihat penanganannya di
+    // handleStoreLogin/handleAdminLogin di bawah (err.status === 429).
+
+    const saveSession = (role, extra = {}) => {
+      const session = { role, ...extra, loginAt: Date.now(), expiresAt: Date.now() + SESSION_DURATION_MS };
+      localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+      return session;
+    };
+    const loadSession = () => {
+      try {
+        const s = JSON.parse(localStorage.getItem(SESSION_KEY));
+        if (!s) return null;
+        if (Date.now() > s.expiresAt) {
+          localStorage.removeItem(SESSION_KEY);
+          return null;
+        }
+        return s;
+      } catch { return null; }
+    };
+    const clearSession = () => localStorage.removeItem(SESSION_KEY);
+
+    // ==========================================
+    // DEBOUNCE UNTUK lucide.createIcons()
+    // ==========================================
+    // Sebelumnya beberapa halaman memanggil window.lucide.createIcons() di useEffect TANPA
+    // dependency array, artinya fungsi ini (yang men-scan SELURUH DOM untuk cari ikon) jalan
+    // ulang setiap kali ada render apa pun — termasuk tiap kali user mengetik satu huruf di form.
+    // Ini salah satu penyebab utama web terasa "berat" terutama saat mengisi form laporan yang
+    // panjang. Sekarang dikumpulkan dulu jadi satu panggilan per frame (requestAnimationFrame),
+    // bukan langsung tiap render, tanpa mengubah ikon yang tampil sama sekali.
+    let _lucideScheduled = false;
+    const scheduleLucideIcons = () => {
+      if (_lucideScheduled) return;
+      _lucideScheduled = true;
+      requestAnimationFrame(() => {
+        _lucideScheduled = false;
+        if (window.lucide) window.lucide.createIcons();
+      });
+    };
+
+    // Kirim laporan ke Telegram sering "gagal terhubung" bukan karena Bot Token/Chat ID
+    // salah, tapi karena koneksi HP sempat putus-nyambung sepersekian detik (pindah BTS,
+    // WiFi<->data seluler, dsb). Sebelumnya sekali gagal langsung tampil toast error dan
+    // laporan harus dikirim ulang manual. Sekarang setiap request ke Telegram otomatis
+    // dicoba lagi sampai 2x tambahan (dengan jeda singkat) SEBELUM benar-benar dianggap gagal.
+    const fetchWithRetry = async (url, options, retries = 2, delayMs = 1200) => {
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+          return await fetch(url, options);
+        } catch (err) {
+          if (attempt === retries) throw err;
+          await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+        }
+      }
+    };
+
+    // ==========================================
+    // TELEGRAM - HELPER TERPUSAT (PERBAIKAN BUG #4)
+    // ==========================================
+    // Sebelumnya, setiap fitur "Kirim ke Telegram" (laporan penjualan, kedatangan barang, dll)
+    // punya kode fetch() sendiri yang terpisah-pisah, dengan penanganan error yang tidak
+    // konsisten — kalau gagal, hanya muncul pesan generik ("Koneksi bermasalah") tanpa detail
+    // apa pun di console, sehingga sulit diketahui APAKAH penyebabnya token salah, chat ID
+    // salah, format pesan ditolak Telegram, atau jaringan benar-benar putus.
+    //
+    // Fungsi di bawah ini SELALU dibungkus try-catch dan TIDAK PERNAH melempar exception ke
+    // pemanggilnya (tidak akan membuat aplikasi crash / unhandled promise rejection) — semua
+    // kegagalan dikembalikan sebagai `{ ok: false, error }` sekaligus dicatat detailnya ke
+    // console.error, supaya penyebab sebenarnya selalu bisa ditelusuri.
+    const sendTelegramMessage = async (token, chatId, text, options = {}) => {
+      const cleanToken = String(token || '').trim();
+      const cleanChatId = String(chatId || '').trim();
+      if (!cleanToken || !cleanChatId) {
+        const msg = 'Bot Token / Chat ID Telegram belum diatur.';
+        console.error('[Telegram sendMessage] Gagal:', msg);
+        return { ok: false, error: msg };
+      }
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: cleanChatId, text, parse_mode: options.parseMode || 'Markdown' }),
+        });
+        let result;
+        try {
+          result = await response.json();
+        } catch (parseErr) {
+          throw new Error(`Server Telegram merespons status ${response.status} (bukan format yang dikenali). Kemungkinan Bot Token salah.`);
+        }
+        if (!result.ok) {
+          throw new Error(result.description || `Telegram menolak permintaan (kode ${result.error_code || '-'})`);
+        }
+        return { ok: true, result };
+      } catch (err) {
+        const message = (err instanceof TypeError)
+          ? 'Tidak bisa menghubungi server Telegram (jaringan terputus/diblokir).'
+          : ((err && err.message) || 'Gagal mengirim pesan ke Telegram.');
+        console.error('[Telegram sendMessage] Gagal mengirim laporan. Detail:', err);
+        return { ok: false, error: message };
+      }
+    };
+
+    // Kirim file/dokumen (mis. rekap laporan sebagai file) ke Telegram lewat sendDocument,
+    // dengan try-catch + timeout + logging yang sama ketatnya dengan sendTelegramMessage di atas.
+    const sendTelegramDocument = async (token, chatId, blob, filename, caption) => {
+      const cleanToken = String(token || '').trim();
+      const cleanChatId = String(chatId || '').trim();
+      if (!cleanToken || !cleanChatId) {
+        const msg = 'Bot Token / Chat ID Telegram belum diatur.';
+        console.error('[Telegram sendDocument] Gagal:', msg);
+        return { ok: false, error: msg };
+      }
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      try {
+        const formData = new FormData();
+        formData.append('chat_id', cleanChatId);
+        if (caption) formData.append('caption', caption);
+        formData.append('parse_mode', 'Markdown');
+        formData.append('document', blob, filename || 'laporan.txt');
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${cleanToken}/sendDocument`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
+        });
+        let result;
+        try {
+          result = await response.json();
+        } catch (parseErr) {
+          throw new Error(`Server Telegram merespons status ${response.status} (bukan format yang dikenali). Cek Bot Token & Chat ID.`);
+        }
+        if (!result.ok) {
+          throw new Error(result.description || `Telegram menolak permintaan (kode ${result.error_code || '-'})`);
+        }
+        return { ok: true, result };
+      } catch (err) {
+        const message = (err && err.name === 'AbortError')
+          ? 'Koneksi terlalu lambat (timeout 30 detik).'
+          : (err instanceof TypeError)
+            ? 'Tidak bisa menghubungi server Telegram (jaringan terputus/diblokir).'
+            : ((err && err.message) || 'Gagal mengirim file ke Telegram.');
+        console.error('[Telegram sendDocument] Gagal mengirim file. Detail:', err);
+        return { ok: false, error: message };
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    };
+
+
+    // ==========================================
+    // GANTI WEBSOCKET -> HTTPS BIASA UNTUK SEMUA PEMBACAAN DATA
+    // ==========================================
+    // db.ref(...).on('value', ...) dan .once('value') dari Firebase SDK memakai koneksi
+    // WebSocket (wss://) di belakang layar. Di sebagian jaringan seluler, WebSocket ke domain
+    // yang jarang dikenal suka diblokir/lambat, sehingga data "tidak muncul" atau web terasa
+    // berat menunggu koneksi itu. Dua helper generik di bawah ini dipakai di SELURUH aplikasi
+    // (form penjualan, inventory, riwayat, chat, dsb) supaya SETIAP pembacaan data mengambil
+    // data awal lewat HTTPS biasa (REST API bawaan Firebase, ".json") terlebih dulu — cepat &
+    // tahan blokir jaringan — baru setelah itu tetap nyambung listener realtime seperti biasa
+    // untuk update live selanjutnya. Tidak ada fitur live-update yang hilang, cuma tampilan
+    // awalnya jauh lebih cepat & tidak macet kalau WebSocket-nya lambat/diblokir.
+    // Sistem baru (Cloudflare) sudah pakai HTTPS biasa di semua operasi (tidak ada WebSocket sama
+    // sekali), jadi trik REST-dulu-fallback-SDK yang dulu dipakai untuk Firebase tidak diperlukan lagi.
+    // Fungsi-fungsi di bawah ini dipertahankan NAMA & PARAMETERNYA supaya seluruh kode lain di app
+    // (yang memanggilnya) tidak perlu diubah sama sekali — isinya saja yang disederhanakan.
+    const bindLiveValue = (ref, handler, errHandler) => {
+      if (errHandler) ref.on('value', handler, errHandler);
+      else ref.on('value', handler);
+      return () => ref.off('value', handler);
+    };
+
+    const restOnce = async (ref) => ref.once('value');
+    const restSet = async (ref, data) => ref.set(data);
+    const restMultiUpdate = async (updates) => db.ref('/').update(updates);
+    const restPush = async (ref, data) => ref.push(data);
+    const restRemove = async (ref) => ref.remove();
+
+    // ==========================================
+    // PANDUAN SOP - HELPER UPLOAD FOTO/VIDEO
+    // ==========================================
+    // Kompres foto (resize + JPEG quality) sebelum diupload ke Firebase Storage, supaya
+    // ringan & hemat kuota.
+    const compressSopImageFile = (file, maxWidth = 1000, quality = 0.7) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          let { width, height } = img;
+          if (width > maxWidth) {
+            height = Math.round((height * maxWidth) / width);
+            width = maxWidth;
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          canvas.toBlob((blob) => {
+            if (!blob) { reject(new Error('Gagal mengompres gambar.')); return; }
+            resolve(blob);
+          }, 'image/jpeg', quality);
+        };
+        img.onerror = () => reject(new Error('Gagal memuat gambar. Pastikan formatnya JPG/PNG.'));
+        img.src = reader.result;
+      };
+      reader.onerror = () => reject(new Error('Gagal membaca file.'));
+      reader.readAsDataURL(file);
+    });
+
+    // Kompres video: perkecil resolusi & bitrate dengan menggambar ulang frame ke <canvas>
+    // lalu merekamnya sebagai WebM (VP9/VP8) via MediaRecorder. Kalau browser tidak
+    // mendukung (mis. beberapa versi Safari lama), fallback: upload video asli apa adanya.
+    const isVideoCompressionSupported = () => {
+      try {
+        return typeof MediaRecorder !== 'undefined'
+          && typeof HTMLCanvasElement.prototype.captureStream === 'function'
+          && (MediaRecorder.isTypeSupported('video/webm;codecs=vp9') || MediaRecorder.isTypeSupported('video/webm;codecs=vp8') || MediaRecorder.isTypeSupported('video/webm'));
+      } catch (e) {
+        return false;
+      }
+    };
+
+    const compressSopVideoFile = (file, maxWidth = 854, videoBitsPerSecond = 1500000) => new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const video = document.createElement('video');
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = 'auto';
+      video.src = url;
+
+      const cleanup = () => URL.revokeObjectURL(url);
+
+      video.onloadedmetadata = () => {
+        let { videoWidth: width, videoHeight: height } = video;
+        if (!width || !height) { cleanup(); reject(new Error('Video tidak valid.')); return; }
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        const stream = canvas.captureStream(30);
+        const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+          ? 'video/webm;codecs=vp9'
+          : (MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8' : 'video/webm');
+        let recorder;
+        try {
+          recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond });
+        } catch (e) {
+          cleanup();
+          reject(e);
+          return;
+        }
+        const chunks = [];
+        let rafId = null;
+        recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+        recorder.onstop = () => {
+          cleanup();
+          if (rafId) cancelAnimationFrame(rafId);
+          if (chunks.length === 0) { reject(new Error('Hasil kompresi video kosong.')); return; }
+          resolve(new Blob(chunks, { type: mimeType }));
+        };
+        recorder.onerror = (e) => { cleanup(); if (rafId) cancelAnimationFrame(rafId); reject((e && e.error) || new Error('Gagal mengompres video.')); };
+
+        const drawFrame = () => {
+          if (video.paused || video.ended) return;
+          ctx.drawImage(video, 0, 0, width, height);
+          rafId = requestAnimationFrame(drawFrame);
+        };
+        video.onplay = () => { recorder.start(250); drawFrame(); };
+        video.onended = () => { if (recorder.state !== 'inactive') recorder.stop(); };
+        video.onerror = () => { cleanup(); reject(new Error('Gagal memuat video untuk dikompres.')); };
+        video.play().catch((err) => { cleanup(); reject(err); });
+      };
+      video.onerror = () => { cleanup(); reject(new Error('Gagal memuat video. Pastikan formatnya didukung (mis. MP4).')); };
+    });
+
+    // Upload satu file (foto/video) SOP — DISIMPAN LANGSUNG DI REALTIME DATABASE (GRATIS,
+    // tidak butuh Firebase Storage sama sekali, jadi tidak ada lagi masalah CORS/Storage
+    // Rules/Blaze). Foto & video dikompres dulu di browser, lalu diubah jadi teks base64 dan
+    // disimpan sebagai field `url` (data URI) langsung di node sopCategories/{catId}/media/{id}.
+    // Karena Realtime Database punya batas ±10MB per nilai teks, ukuran hasil kompresi dijaga
+    // jauh di bawah itu supaya aman.
+    const MAX_SOP_VIDEO_MB = 40; // batas ukuran file ASLI sebelum diproses (supaya browser tak berat)
+    const MAX_SOP_IMAGE_STORED_MB = 1.2; // batas ukuran FOTO setelah dikompres
+    const MAX_SOP_VIDEO_STORED_MB = 6; // batas ukuran VIDEO setelah dikompres (base64-nya ~8MB, masih aman)
+
+    // Whitelist ekstensi yang diizinkan untuk upload SOP. Dipakai sebagai FALLBACK validasi
+    // ketika `file.type` (MIME type dari browser) kosong/tidak bisa dibaca — kasus ini sering
+    // terjadi pada foto HEIC dari iPhone, atau file yang di-drag-drop dari beberapa file manager,
+    // yang membuat `file.type.startsWith('image/')` bernilai FALSE meski filenya sebenarnya valid.
+    const SOP_ALLOWED_IMAGE_EXT = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'bmp'];
+    const SOP_ALLOWED_VIDEO_EXT = ['mp4', 'mov', 'webm', 'mkv', '3gp', 'avi'];
+
+    const getFileExtension = (filename) => {
+      const match = /\.([a-zA-Z0-9]+)$/.exec(String(filename || ''));
+      return match ? match[1].toLowerCase() : '';
+    };
+
+    // Bikin nama file unik untuk disimpan, supaya tidak ada bentrok nama antar upload
+    // (mis. dua admin upload file "foto.jpg" di waktu yang berdekatan). Format:
+    // sop_{catId}_{timestamp}_{random}.{ekstensi}
+    const buildUniqueSopFileName = (catId, ext) => {
+      const rand = Math.random().toString(36).slice(2, 8);
+      const safeExt = (ext || 'jpg').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'jpg';
+      return `sop_${catId}_${Date.now()}_${rand}.${safeExt}`;
+    };
+
+    // Ubah Blob hasil kompresi menjadi data URI base64 (mis. "data:image/jpeg;base64,...")
+    // supaya bisa langsung dipakai sebagai `src` di <img>/<video> tanpa perlu URL eksternal.
+    const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Gagal membaca hasil kompresi file.'));
+      reader.readAsDataURL(blob);
+    });
+
+    const uploadSopMediaFile = async (catId, file) => {
+      const ext = getFileExtension(file.name);
+      let isImage = file.type.startsWith('image/');
+      let isVideo = file.type.startsWith('video/');
+
+      // FALLBACK VALIDASI: kalau MIME type dari browser kosong/tidak dikenali (mis. HEIC dari
+      // iPhone, atau beberapa hasil drag-drop), coba tentukan jenis file dari EKSTENSI-nya
+      // sebelum benar-benar menolak upload. Ini yang memperbaiki kasus "tidak bisa upload gambar"
+      // padahal filenya sebenarnya foto yang valid.
+      if (!isImage && !isVideo) {
+        if (SOP_ALLOWED_IMAGE_EXT.includes(ext)) isImage = true;
+        else if (SOP_ALLOWED_VIDEO_EXT.includes(ext)) isVideo = true;
+      }
+
+      if (!isImage && !isVideo) {
+        throw new Error(`Format ".${ext || '?'}" tidak didukung. Gunakan foto (JPG/PNG/WEBP/HEIC) atau video (MP4/MOV/WEBM).`);
+      }
+      if (isVideo && file.size > MAX_SOP_VIDEO_MB * 1024 * 1024) {
+        throw new Error(`Ukuran video maksimal ${MAX_SOP_VIDEO_MB}MB.`);
+      }
+      let blob = file;
+      let contentType = 'image/jpeg';
+      if (isImage) {
+        try {
+          // Kompres bertahap: kalau hasil kompresi pertama masih kegedean, coba lagi lebih agresif.
+          blob = await compressSopImageFile(file, 1000, 0.7);
+          if (blob.size > MAX_SOP_IMAGE_STORED_MB * 1024 * 1024) {
+            blob = await compressSopImageFile(file, 700, 0.55);
+          }
+          if (blob.size > MAX_SOP_IMAGE_STORED_MB * 1024 * 1024) {
+            throw new Error('Foto masih terlalu besar setelah dikompres. Coba pilih foto lain atau perkecil dulu.');
+          }
+          contentType = 'image/jpeg';
+        } catch (compressErr) {
+          // Beberapa format (mis. HEIC dari iPhone) tidak semua browser bisa membacanya lewat
+          // <img>/<canvas> untuk dikompres. Daripada langsung gagal total, coba kirim file
+          // ASLINYA apa adanya (masih sudah lolos validasi ekstensi di atas), selama ukurannya
+          // masih wajar. Ini yang tadinya bikin admin "tidak bisa menambahkan gambar" untuk
+          // foto tertentu meskipun filenya sah.
+          console.warn('Kompresi foto gagal, coba pakai file asli:', compressErr);
+          if (file.size > MAX_SOP_IMAGE_STORED_MB * 1024 * 1024) {
+            throw new Error('Foto gagal diproses (format tidak didukung browser ini) dan ukurannya terlalu besar untuk diupload langsung. Coba simpan ulang sebagai JPG/PNG lalu upload lagi.');
+          }
+          blob = file;
+          contentType = file.type || 'image/jpeg';
+        }
+      } else {
+        contentType = file.type;
+        if (isVideoCompressionSupported()) {
+          try {
+            const compressed = await compressSopVideoFile(file);
+            // Hanya pakai hasil kompresi kalau memang lebih kecil dari aslinya.
+            if (compressed && compressed.size > 0 && compressed.size < file.size) {
+              blob = compressed;
+              contentType = 'video/webm';
+            }
+          } catch (e) {
+            console.warn('Kompresi video gagal, coba pakai video asli:', e);
+          }
+        }
+        if (blob.size > MAX_SOP_VIDEO_STORED_MB * 1024 * 1024) {
+          throw new Error(`Video masih ${(blob.size / 1024 / 1024).toFixed(1)}MB setelah dikompres (maks ${MAX_SOP_VIDEO_STORED_MB}MB). Coba rekam video lebih pendek atau resolusi lebih rendah.`);
+        }
+      }
+      // `name` = nama unik yang dipakai sebagai identitas file tersimpan (mencegah bentrok
+      // antar-upload); `originalName` tetap disimpan supaya UI bisa menampilkan nama asli
+      // yang dikenali admin.
+      const storedExt = isImage ? 'jpg' : (getFileExtension(file.name) || 'webm');
+      const uniqueName = buildUniqueSopFileName(catId, storedExt);
+      // Upload ke R2 (bukan disimpan sebagai base64 di database lagi) — `path` = key R2,
+      // dipakai nanti oleh deleteSopMediaFile saat kategori/media ini dihapus.
+      const { url, key } = await uploadMediaToR2(blob, `sopMedia/${catId}`, storedExt);
+      return { type: isImage ? 'image' : 'video', url, path: key, name: uniqueName, originalName: file.name, size: blob.size, contentType };
+    };
+
+    // Hapus file SOP dari R2. `path` = R2 key yang tersimpan di field `path` pada tiap item media
+    // (lihat uploadSopMediaFile). Best-effort lewat deleteMediaFromR2, tidak mem-block hapus data DB.
+    const deleteSopMediaFile = async (path) => deleteMediaFromR2(path);
+
+    // ==========================================
+    // AUTO-HAPUS DATA LAMA (>30 HARI) & NOTIFIKASI BROWSER
+    // ==========================================
+    const DATA_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 hari, agar database & aplikasi tetap ringan
+
+    // Hapus entri pada sebuah Firebase ref yang usianya sudah lebih dari 30 hari.
+    // getTimestamp(item, key) harus mengembalikan angka epoch ms dari entri tsb (return 0/null = tidak pernah dihapus otomatis).
+    // getMediaKeys(item, key) OPSIONAL — kalau diisi, harus mengembalikan array key R2 (atau kosong)
+    // yang menempel di entri tsb, supaya file fotonya ikut dihapus dari R2 dan tidak jadi sampah
+    // menumpuk di storage walau baris databasenya sudah bersih.
+    const pruneOldEntries = async (ref, getTimestamp, getMediaKeys) => {
+      try {
+        const snap = await ref.once('value');
+        const data = snap.val();
+        if (!data) return 0;
+        const now = Date.now();
+        const updates = {};
+        const mediaKeysToDelete = [];
+        Object.keys(data).forEach((key) => {
+          const ts = getTimestamp(data[key], key);
+          if (ts && (now - ts) > DATA_RETENTION_MS) {
+            updates[key] = null; // null pada multi-path update Firebase = hapus key tsb
+            if (getMediaKeys) mediaKeysToDelete.push(...(getMediaKeys(data[key], key) || []));
+          }
+        });
+        const staleCount = Object.keys(updates).length;
+        if (staleCount > 0) {
+          await ref.update(updates);
+          if (mediaKeysToDelete.length > 0) await deleteMediaFromR2(mediaKeysToDelete);
+        }
+        return staleCount;
+      } catch (err) {
+        console.error('Gagal membersihkan data lama:', err);
+        return 0;
+      }
+    };
+
+    // OPTIMASI (2026-07-19): pruneOldEntries() di atas membaca SELURUH isi node tanpa batas
+    // (perlu, supaya tahu persis mana yang usianya >30 hari). Ini dipanggil tiap kali dashboard
+    // toko/admin dibuka — kalau staff refresh/login-ulang berkali-kali sehari, biaya baca
+    // penuh ini ikut berkali-kali juga, padahal cukup dijalankan SEKALI SEHARI (data yang
+    // usianya >30 hari tidak berubah drastis dalam hitungan jam). Guard ini membatasi
+    // eksekusi nyata cuma 1x per 24 jam per key, sisanya di-skip (return langsung).
+    const shouldRunPruneNow = (key) => {
+      try {
+        const last = parseInt(localStorage.getItem(`tarobun_last_prune_${key}`) || '0', 10);
+        if (Date.now() - last < 24 * 60 * 60 * 1000) return false;
+        localStorage.setItem(`tarobun_last_prune_${key}`, Date.now().toString());
+        return true;
+      } catch (e) {
+        return true; // kalau localStorage bermasalah, tetap jalankan (aman, cuma tidak hemat)
+      }
+    };
+
+    // ===== PUSH NOTIFICATION NATIF (APK Capacitor) — ditambahkan 2026-07-18 =====
+    // Kalau app ini dibuka LEWAT APK hasil bungkus Capacitor, window.Capacitor akan ada
+    // (di-inject otomatis oleh native shell-nya). Kalau dibuka lewat browser biasa (HP/PC),
+    // window.Capacitor tidak ada, jadi tetap pakai jalur Notification API web yang lama.
+    const isNativeApp = () => !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
+
+    // Minta izin + daftar device ke Firebase Cloud Messaging, lalu kirim token-nya ke
+    // Worker (disimpan di D1) supaya backend tahu ke device mana push harus dikirim.
+    const registerNativePush = async () => {
+      try {
+        const PushNotifications = window.Capacitor?.Plugins?.PushNotifications;
+        if (!PushNotifications) { console.log('Plugin PushNotifications belum terpasang.'); return; }
+        const perm = await PushNotifications.requestPermissions();
+        if (perm.receive !== 'granted') return;
+        await PushNotifications.register();
+
+        PushNotifications.addListener('registration', async (token) => {
+          try {
+            await __apiFetch(`${WORKER_BASE}/api/push/register`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+              body: JSON.stringify({ fcmToken: token.value, platform: 'android' }),
+            });
+          } catch (e) { console.log('Gagal daftar push token ke server:', e); }
+        });
+        PushNotifications.addListener('registrationError', (err) => {
+          console.log('Registrasi push notification gagal:', err);
+        });
+        // Notifikasi masuk SAAT app sedang dibuka: sistem TIDAK menampilkan pop-up otomatis
+        // (perilaku standar Android), jadi kalau mau tetap kelihatan sebagai toast di dalam
+        // app, tangani di sini. Kalau app di-background/ditutup, sistem yang menampilkan
+        // pop-up otomatis tanpa perlu kode tambahan di sini.
+        PushNotifications.addListener('pushNotificationReceived', (n) => {
+          console.log('Push diterima (app sedang terbuka):', n);
+        });
+        PushNotifications.addListener('pushNotificationActionPerformed', (action) => {
+          console.log('User tap notifikasi:', action);
+        });
+      } catch (e) {
+        console.log('registerNativePush error:', e);
+      }
+    };
+
+    // Minta izin notifikasi browser (dipanggil sekali saat user berhasil login)
+    const requestNotificationPermission = () => {
+      if (isNativeApp()) { registerNativePush(); return; }
+      if (typeof Notification === 'undefined') return;
+      try {
+        // BUGFIX (2026-07-18): di sebagian WebView/browser embedded, fitur Notifikasi
+        // di-blokir sepenuhnya (mis. lewat Permissions-Policy internal WebView-nya), dan
+        // Notification.requestPermission() melempar SecurityError SECARA SINKRON —
+        // bukan promise yang reject. `.catch()` saja TIDAK menangkap error sinkron ini,
+        // makanya error "SecurityError: The operation is insecure." tetap lolos ke
+        // console walau sudah ada .catch(). Harus dibungkus try/catch di luar juga.
+        if (Notification.permission === 'default') {
+          Notification.requestPermission().catch(() => {});
+        }
+      } catch (err) {
+        // Diam-diam saja: notifikasi browser cuma fitur pelengkap, tidak boleh sampai
+        // mengganggu/menghentikan alur login toko/admin kalau browsernya tidak mendukung.
+      }
+    };
+
+    // Tampilkan notifikasi native browser. Hanya muncul saat tab TIDAK sedang aktif dilihat
+    // (saat tab aktif, cukup toast di dalam app supaya tidak dobel mengganggu).
+    //
+    // PENTING: `new Notification(...)` langsung HANYA berjalan di sebagian browser desktop.
+    // Di Chrome Android (dan sebagian besar browser mobile modern) constructor ini akan gagal
+    // secara diam-diam (error "Illegal constructor") karena mobile Chrome MEWAJIBKAN notifikasi
+    // ditampilkan lewat Service Worker (registration.showNotification). Ini sebabnya sebelumnya
+    // notifikasi lancar di localhost desktop tapi hilang total saat dites di HP.
+    const sendBrowserNotification = async (title, body) => {
+      if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+      if (document.visibilityState === 'visible') return;
+      try {
+        if ('serviceWorker' in navigator) {
+          const reg = await navigator.serviceWorker.ready;
+          if (reg && reg.showNotification) {
+            await reg.showNotification(title, {
+              body,
+              tag: 'tarobun-chat',
+              renotify: true,
+              icon: '/icon-192.png',
+              badge: '/icon-192.png',
+              vibrate: [200, 100, 200]
+            });
+            return;
+          }
+        }
+        // Fallback untuk browser desktop lama yang masih mengizinkan constructor langsung
+        const n = new Notification(title, { body, tag: 'tarobun-chat' });
+        n.onclick = () => { window.focus(); n.close(); };
+      } catch (err) {
+        console.error('Gagal menampilkan notifikasi browser:', err);
+      }
+    };
+
+    // Mainkan suara notifikasi singkat (2 nada "ting-tung") saat ada pesan chat baru masuk,
+    // baik di sisi Admin maupun Toko. Dibuat langsung lewat Web Audio API (tanpa file audio
+    // eksternal) supaya tidak kena blokir CSP dan selalu tersedia offline.
+    let _notifAudioCtx = null;
+    const playNotificationSound = () => {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        if (!_notifAudioCtx) _notifAudioCtx = new Ctx();
+        const ctx = _notifAudioCtx;
+        if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+        const playTone = (freq, startOffset, duration) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.value = freq;
+          const startTime = ctx.currentTime + startOffset;
+          gain.gain.setValueAtTime(0.0001, startTime);
+          gain.gain.exponentialRampToValueAtTime(0.22, startTime + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(startTime);
+          osc.stop(startTime + duration + 0.02);
+        };
+        playTone(880, 0, 0.15);
+        playTone(1175, 0.15, 0.18);
+      } catch (err) {
+        console.error('Gagal memutar suara notifikasi:', err);
+      }
+    };
+
+    // ==========================================
+    // KONTEN TUR PANDUAN (ONBOARDING)
+    // ==========================================
+    // Setiap step boleh punya `target`: CSS selector (mengacu ke atribut data-tour yang
+    // ditempel di tombol menu sidebar asli). Kalau target ada & ketemu di DOM, TourGuide akan
+    // menyorot (spotlight) tombol tersebut langsung di sidebar. Kalau tidak ada target (step
+    // pembuka/penutup yang sifatnya info umum), tampil sebagai modal biasa di tengah layar.
+    const STORE_ONBOARDING_STEPS = [
+      { icon: 'hand', title: 'Selamat Datang! 👋', desc: 'Ini adalah aplikasi pencatatan toko Anda. Yuk kenali menu-menu utamanya satu per satu — akan disorot langsung di menu sebelah.' },
+      { icon: 'trending-up', title: 'Dasbor', desc: 'Menampilkan ringkasan penjualan, pemakaian bahan baku, dan performa toko hari ini.', target: '[data-tour="menu-dashboard"]' },
+      { icon: 'plus-circle', title: 'Laporan Penjualan', desc: 'Catat jumlah roti & minuman terjual, nilai transaksi, serta suhu freezer/chiller setiap hari.', target: '[data-tour="menu-sales"]' },
+      { icon: 'package', title: 'SO Stok', desc: 'Catat stok opname bahan baku dan barang packaging yang tersisa.', target: '[data-tour="menu-inventory"]' },
+      { icon: 'calendar-clock', title: 'PO (Pre Order)', desc: 'Catat pesanan pre order pelanggan (bukti bayar, isi pesanan, jadwal pickup) dan kirim ke grup Telegram — otomatis diingatkan 1 jam sebelum waktu pickup.', target: '[data-tour="menu-preorder"]' },
+      { icon: 'clipboard-check', title: 'BAP (Berita Acara Penyesuaian)', desc: 'Laporkan selisih nominal antara POS dengan channel pembayaran (EDC/QRIS/Gofood/GrabFood/ShopeeFood) dan kirim ke Telegram.', target: '[data-tour="menu-bap"]' },
+      { icon: 'truck', title: 'Datang Barang', desc: 'Catat barang yang baru datang dari gudang pusat, termasuk barang yang tidak sesuai.', target: '[data-tour="menu-kedatangan"]' },
+      { icon: 'camera', title: 'Foto Rijek', desc: 'Unggah foto bun rijek, barang rijek, atau waste sebagai bukti dan dikirim ke Telegram.', target: '[data-tour="menu-wasteFoto"]' },
+      { icon: 'printer', title: 'Printing', desc: 'Cetak label Premix (nama barang, tanggal buat/exp, asal bahan) dan Catatan Stok (FD/toping + jumlah). Cocok untuk printer biasa maupun thermal.', target: '[data-tour="menu-printing"]' },
+      { icon: 'history', title: 'Riwayat Laporan', desc: 'Lihat & unduh riwayat laporan harian yang tersimpan di Cloud.', target: '[data-tour="menu-history"]' },
+      { icon: 'book-open', title: 'Panduan SOP', desc: 'Semua SOP toko ada di sini — buka menu ini kapan pun butuh mengingat langkah kerja yang benar.', target: '[data-tour="menu-sop"]' },
+      { icon: 'message-circle', title: 'Chat Admin', desc: 'Hubungi admin pusat langsung lewat menu Chat jika ada kendala atau pertanyaan.', target: '[data-tour="menu-chat"]' },
+      { icon: 'shield-check', title: 'Keamanan Akun', desc: 'Sesi login Anda otomatis berakhir setiap 24 jam 30 menit demi keamanan. Jaga kerahasiaan token toko Anda!' },
+    ];
+    const ADMIN_ONBOARDING_STEPS = [
+      { icon: 'hand', title: 'Selamat Datang, Admin! 👋', desc: 'Panel ini khusus untuk mengelola seluruh cabang toko dari satu tempat. Yuk kenali menunya.' },
+      { icon: 'store', title: 'Kelola Toko', desc: 'Tambah cabang toko baru dan dapatkan token login untuk diberikan ke toko tersebut.', target: '[data-tour="menu-stores"]' },
+      { icon: 'eye', title: 'Pantau Toko', desc: 'Di dalam menu Kelola Toko, Anda bisa melihat stok, foto rijek, dan value penjualan tiap cabang secara real-time.' },
+      { icon: 'trash-2', title: 'Hapus Toko', desc: 'Nonaktifkan/hapus akses toko yang sudah tidak beroperasi kapan saja, juga dari menu Kelola Toko.' },
+      { icon: 'file-cog', title: 'Form Builder', desc: 'Atur field tambahan pada form Laporan Penjualan & SO Stok yang dipakai semua toko.', target: '[data-tour="menu-formbuilder"]' },
+      { icon: 'book-open', title: 'Panduan SOP', desc: 'Kelola konten SOP yang akan tampil di aplikasi setiap toko.', target: '[data-tour="menu-sop"]' },
+      { icon: 'message-circle', title: 'Chat', desc: 'Balas pesan dari setiap toko langsung dari panel admin.', target: '[data-tour="menu-chat"]' },
+      { icon: 'shield-check', title: 'Keamanan', desc: 'Token toko hanya ditampilkan sekali saat dibuat — segera salin & simpan dengan aman.' },
+    ];
+
+    // Daftar pekerjaan wajib yang TIDAK BOLEH dilupakan kasir/karyawan toko — ditampilkan sebagai
+    // pop-up wajib di akhir tur onboarding (harus dicentang & dikonfirmasi, tidak bisa ditutup asal-asalan).
+    const MANDATORY_STORE_CHECKLIST = [
+      { icon: 'calculator', text: 'Pastikan hasil closing kasir (uang fisik) sudah sesuai dengan catatan sistem sebelum shift berakhir.' },
+      { icon: 'package-check', text: 'Cek fisik barang datang dari gudang pusat satu per satu — jangan hanya tanda tangan tanpa mengecek.' },
+      { icon: 'clipboard-check', text: 'Isi & kirim laporan BAP (selisih transaksi EDC/QRIS/Gofood/GrabFood/ShopeeFood) sebelum logout/tutup toko.' },
+      { icon: 'lock', text: 'Jangan bagikan token/kode login toko ke siapa pun yang tidak berwenang.' },
+    ];
+    const MANDATORY_ADMIN_CHECKLIST = [
+      { icon: 'clipboard-check', text: 'Pantau laporan BAP tiap toko secara berkala — selisih yang tidak wajar harus segera ditindaklanjuti.' },
+      { icon: 'key', text: 'Token toko hanya tampil sekali saat dibuat. Simpan dengan aman sebelum menutup dialog pembuatan toko.' },
+      { icon: 'message-circle', text: 'Balas chat dari toko sesegera mungkin, terutama laporan kendala operasional mendesak.' },
+    ];
+
+    // Komponen tombol "titik" indikator langkah pada TourGuide (dipakai di tooltip & modal info).
+    function TourStepDots({ steps, idx }) {
+      return (
+        <div className="flex items-center justify-center gap-1.5 mb-4 flex-wrap">
+          {steps.map((_, i) => (
+            <span key={i} className={`h-1.5 rounded-full transition-all ${i === idx ? 'w-5 bg-purple-700' : 'w-1.5 bg-slate-200'}`}></span>
+          ))}
+        </div>
+      );
+    }
+
+    // TourGuide: onboarding interaktif dengan spotlight highlight ke elemen menu ASLI di sidebar
+    // (bukan cuma modal generik). Ringan: 1 kotak spotlight (trik box-shadow, murni CSS) + 1 kartu
+    // tooltip yang posisinya dihitung ulang dari getBoundingClientRect() elemen target, tanpa
+    // request API apa pun. Kalau step tidak punya target, tampil sebagai modal di tengah layar
+    // (dipakai untuk step pembuka & step info yang tidak punya menu fisik).
+    function TourGuide({ steps, onFinish, onOpenMenu }) {
+      const [idx, setIdx] = useState(0);
+      const [rect, setRect] = useState(null);
+      const step = steps[idx];
+      const isLast = idx === steps.length - 1;
+
+      // Buka sidebar hamburger otomatis kalau ada step yang butuh menyorot menu di dalamnya,
+      // supaya pengguna tidak perlu membuka menu manual saat tur berjalan.
+      useEffect(() => {
+        const needsMenu = steps.some(s => s.target);
+        if (needsMenu && onOpenMenu) onOpenMenu(true);
+        scheduleLucideIcons();
+      }, []);
+
+      useEffect(() => {
+        scheduleLucideIcons();
+        if (!step.target) { setRect(null); return; }
+        let cancelled = false;
+        const measure = () => {
+          if (cancelled) return;
+          const el = document.querySelector(step.target);
+          if (el) {
+            el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            const r = el.getBoundingClientRect();
+            setRect({ top: r.top, left: r.left, width: r.width, height: r.height });
+          } else {
+            setRect(null);
+          }
+        };
+        const t = setTimeout(measure, 320); // tunggu animasi buka sidebar (0.28s) selesai
+        window.addEventListener('resize', measure);
+        return () => { cancelled = true; clearTimeout(t); window.removeEventListener('resize', measure); };
+      }, [idx]);
+
+      const goNext = () => { if (isLast) onFinish(); else setIdx(idx + 1); };
+      const skipAll = () => onFinish();
+
+      // Modal biasa di tengah (tanpa target)
+      if (!rect) {
+        return (
+          <div className="fixed inset-0 z-[102] bg-black/60 flex items-center justify-center p-4 animate-fadeIn">
+            <div className="bg-white rounded-2xl animate-scaleIn max-w-sm w-full p-6 shadow-2xl">
+              <div className="w-12 h-12 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center mb-4">
+                <i data-lucide={step.icon} className="w-6 h-6"></i>
+              </div>
+              <h3 className="font-bold text-slate-800 text-base mb-1">{step.title}</h3>
+              <p className="text-sm text-slate-500 mb-5">{step.desc}</p>
+              <TourStepDots steps={steps} idx={idx} />
+              <div className="flex items-center justify-between gap-2">
+                <button onClick={skipAll} className="text-xs font-bold text-slate-500 hover:text-slate-700 px-2 py-2">
+                  Lewati Semua
+                </button>
+                <button onClick={goNext} className="bg-purple-800 hover:bg-purple-900 text-white text-xs font-bold px-4 py-2.5 rounded-xl">
+                  {isLast ? 'Selesai' : 'Lanjut'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      // Mode spotlight: sorot elemen menu asli + kartu tooltip mengikuti posisinya
+      const pad = 6;
+      const boxTop = Math.max(rect.top - pad, 4);
+      const boxLeft = Math.max(rect.left - pad, 4);
+      const boxWidth = rect.width + pad * 2;
+      const boxHeight = rect.height + pad * 2;
+
+      const spaceBelow = window.innerHeight - (rect.top + rect.height);
+      const placeBelow = spaceBelow > 200 || spaceBelow > rect.top;
+      const cardTop = placeBelow
+        ? Math.min(rect.top + rect.height + 14, window.innerHeight - 220)
+        : Math.max(rect.top - 14, 12);
+      const cardLeft = Math.min(Math.max(rect.left, 12), window.innerWidth - 296);
+
+      return (
+        <React.Fragment>
+          {/* Penahan klik: mencegah pengguna tidak sengaja menutup sidebar/menekan menu lain saat tur aktif */}
+          <div className="tour-click-shield" onClick={(e) => e.stopPropagation()}></div>
+          <div
+            className="tour-spotlight-box"
+            style={{ top: boxTop, left: boxLeft, width: boxWidth, height: boxHeight }}
+          ></div>
+          <div
+            className="tour-tooltip-card animate-scaleIn"
+            style={{ top: cardTop, left: cardLeft, transform: placeBelow ? 'none' : 'translateY(-100%)' }}
+          >
+            <div className="bg-white rounded-2xl shadow-2xl p-4 border border-purple-100">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="w-8 h-8 shrink-0 rounded-lg bg-purple-100 text-purple-700 flex items-center justify-center">
+                  <i data-lucide={step.icon} className="w-4 h-4"></i>
+                </div>
+                <h3 className="font-bold text-slate-800 text-sm">{step.title}</h3>
+              </div>
+              <p className="text-xs text-slate-500 mb-3 leading-relaxed">{step.desc}</p>
+              <TourStepDots steps={steps} idx={idx} />
+              <div className="flex items-center justify-between gap-2">
+                <button onClick={skipAll} className="text-[11px] font-bold text-slate-500 hover:text-slate-700 px-2 py-2">
+                  Lewati Semua
+                </button>
+                <button onClick={goNext} className="bg-purple-800 hover:bg-purple-900 text-white text-xs font-bold px-4 py-2.5 rounded-xl">
+                  {isLast ? 'Selesai' : 'Lanjut'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </React.Fragment>
+      );
+    }
+
+    // Pop-up peringatan WAJIB di akhir tur: berisi daftar pekerjaan yang tidak boleh dilupakan.
+    // Sengaja tidak bisa ditutup lewat klik backdrop/tombol X — hanya lewat tombol konfirmasi,
+    // dan tombol itu baru aktif setelah kotak centang "sudah membaca" dicentang.
+    function MandatoryChecklistModal({ items, onAcknowledge }) {
+      const [checked, setChecked] = useState(false);
+      useEffect(() => { scheduleLucideIcons(); }, [checked]);
+      return (
+        <div className="fixed inset-0 z-[110] bg-black/75 flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white rounded-2xl animate-scaleIn max-w-sm w-full p-6 shadow-2xl border-t-4 border-rose-600">
+            <div className="w-12 h-12 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center mb-4">
+              <i data-lucide="alert-triangle" className="w-6 h-6"></i>
+            </div>
+            <h3 className="font-bold text-slate-800 text-base mb-1">Jangan Sampai Lupa! ⚠️</h3>
+            <p className="text-xs text-slate-500 mb-4">Beberapa hal ini WAJIB dilakukan setiap hari — mohon dibaca sampai selesai:</p>
+            <ul className="space-y-2 mb-5 max-h-60 overflow-y-auto pr-1">
+              {items.map((item, i) => (
+                <li key={i} className="flex items-start gap-2 text-xs text-slate-700 bg-rose-50 rounded-lg p-2.5">
+                  <i data-lucide={item.icon} className="w-4 h-4 text-rose-600 shrink-0 mt-0.5"></i>
+                  <span>{item.text}</span>
+                </li>
+              ))}
+            </ul>
+            <label className="flex items-start gap-2 mb-4 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={checked}
+                onChange={(e) => setChecked(e.target.checked)}
+                className="mt-0.5 w-4 h-4 accent-rose-600 shrink-0"
+              />
+              <span className="text-xs text-slate-600 font-semibold">Saya sudah membaca & memahami semua poin di atas.</span>
+            </label>
+            <button
+              disabled={!checked}
+              onClick={onAcknowledge}
+              className={`w-full text-xs font-bold px-4 py-3 rounded-xl transition-all ${checked ? 'bg-rose-600 hover:bg-rose-700 text-white' : 'bg-slate-100 text-slate-400 cursor-not-allowed'}`}
+            >
+              Saya Mengerti, Lanjutkan
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // HALAMAN LOGIN (ADMIN & TOKO)
+    // ==========================================
+    // ==========================================
+    // SPLASH SCREEN (animasi pembuka saat aplikasi pertama kali dibuka)
+    // ==========================================
+    // Ditampilkan sebentar (logo fade-in + scale-up) sebelum masuk ke halaman
+    // Login/utama. onFinish dipanggil otomatis lewat animasi CSS "tarobun-splash"
+    // (lihat <style> di <head>) setelah durasi tampil selesai.
+    function SplashScreen({ onFinish }) {
+      useEffect(() => {
+        const timer = setTimeout(onFinish, 1800);
+        return () => clearTimeout(timer);
+      }, [onFinish]);
+
+      return (
+        <div
+          className="tarobun-splash fixed inset-0 z-[999] flex flex-col items-center justify-center bg-gradient-to-br from-purple-900 via-indigo-900 to-slate-900"
+          onAnimationEnd={(e) => { if (e.animationName === 'tarobunSplashOut') onFinish(); }}
+        >
+          <img
+            src="icon-512.png"
+            alt="Tarobun"
+            className="tarobun-splash-logo w-28 h-28 sm:w-32 sm:h-32 rounded-3xl shadow-2xl object-contain bg-white/5"
+          />
+          <div className="tarobun-splash-text mt-5 text-center">
+            <h1 className="text-white font-display font-extrabold text-lg tracking-wide">TAROBUN SO Mandiri Hub</h1>
+            <p className="text-purple-200 text-xs mt-1">Memuat aplikasi...</p>
+          </div>
+        </div>
+      );
+    }
+
+    function LoginScreen({ onLoggedIn }) {
+      const [mode, setMode] = useState('store'); // 'store' | 'admin'
+      const [adminExists, setAdminExists] = useState(null); // null = belum dicek
+      const [storeDirectory, setStoreDirectory] = useState([]);
+      const [dirLoading, setDirLoading] = useState(true);
+      const [dirError, setDirError] = useState(false);
+      const [dirErrorDetail, setDirErrorDetail] = useState('');
+      const [dirFromCache, setDirFromCache] = useState(false);
+      // BARU: penanda "sedang menyegarkan data terbaru di belakang layar" — dipakai saat
+      // daftar toko dari cache SUDAH ditampilkan instan, tapi fetch ke server masih berjalan
+      // diam-diam untuk memastikan datanya paling baru. Beda dengan dirFromCache (yang
+      // menampilkan banner peringatan) — ini sepenuhnya senyap, tidak memblokir apa pun.
+      const [dirBackgroundSync, setDirBackgroundSync] = useState(false);
+      const [adminCheckError, setAdminCheckError] = useState(false);
+      const [reloadTick, setReloadTick] = useState(0);
+      const [error, setError] = useState('');
+      const [loading, setLoading] = useState(false);
+
+      // Form state
+      const [storeId, setStoreId] = useState('');
+      const [token, setToken] = useState('');
+      // Kombobox "Pilih Toko" bisa dicari & discroll (bukan <select> polos lagi) supaya
+      // tidak langsung memuat/menampilkan SEMUA pilihan toko sekaligus memenuhi layar
+      // saat daftar toko banyak — daftar dibatasi tinggi (scroll) + ada input pencarian.
+      const [storeDropdownOpen, setStoreDropdownOpen] = useState(false);
+      const [storeSearchQuery, setStoreSearchQuery] = useState('');
+      const storeDropdownRef = React.useRef(null);
+      const [adminPassword, setAdminPassword] = useState('');
+      const [adminPassword2, setAdminPassword2] = useState('');
+
+      useEffect(() => {
+        scheduleLucideIcons();
+      });
+
+      // Tutup dropdown "Pilih Toko" saat klik di luar area kombobox.
+      useEffect(() => {
+        const handleOutsideClick = (e) => {
+          if (storeDropdownRef.current && !storeDropdownRef.current.contains(e.target)) {
+            setStoreDropdownOpen(false);
+          }
+        };
+        document.addEventListener('mousedown', handleOutsideClick);
+        return () => document.removeEventListener('mousedown', handleOutsideClick);
+      }, []);
+
+      const filteredStoreDirectory = storeDirectory.filter(s =>
+        !storeSearchQuery.trim() || s.name.toLowerCase().includes(storeSearchQuery.trim().toLowerCase())
+      );
+      const selectedStoreName = (storeDirectory.find(s => s.id === storeId) || {}).name || '';
+
+      // Ambil status admin & daftar toko. Diberi timeout + AUTO-RETRY (dengan jeda makin lama) +
+      // tombol "Muat Ulang" manual, supaya kalau koneksi Firebase lambat/putus-nyambung (jaringan
+      // seluler lemah, baru pindah WiFi/data, dsb), aplikasi mencoba lagi sendiri beberapa kali dulu
+      // sebelum benar-benar menampilkan pesan error ke pengguna (ini penyebab utama keluhan
+      // "pilih toko tidak muncul" / "gagal memuat data dari server" saat koneksi kurang stabil).
+      //
+      // PERBAIKAN (stale-while-revalidate): sebelumnya halaman SELALU menunggu penuh sampai
+      // fetch ke server selesai sebelum menampilkan apa pun ("Memuat daftar toko..." blocking),
+      // padahal HP ini mungkin sudah punya daftar toko tersimpan dari login sebelumnya
+      // (tarobun_dir_cache). Sekarang: kalau ada cache, TAMPILKAN DULU SECARA INSTAN (0 network,
+      // dropdown langsung bisa dipakai) sambil diam-diam menyegarkan data terbaru di belakang
+      // layar — baru DIGANTI otomatis begitu data terbaru datang. Kalau tidak ada cache sama
+      // sekali (login pertama kali di HP ini), baru tampil "Memuat daftar toko..." seperti biasa.
+      useEffect(() => {
+        let cancelled = false;
+        let attempt = 0;
+        const MAX_ATTEMPTS = 3;
+
+        let hasCache = false;
+        try {
+          const cached = JSON.parse(localStorage.getItem('tarobun_dir_cache') || 'null');
+          if (cached && cached.length > 0) {
+            hasCache = true;
+            setStoreDirectory(cached);
+            setDirLoading(false);       // sudah ada data untuk dipakai, tidak perlu blocking
+            setDirBackgroundSync(true); // tandai sedang disegarkan diam-diam
+          }
+        } catch (e) {}
+
+        setDirLoading(hasCache ? false : true);
+        setDirError(false);
+        setDirFromCache(false);
+        setAdminCheckError(false);
+
+        const tryLoad = () => {
+          attempt += 1;
+          db.ref('storeDirectory').once('value')
+            .then(snap => {
+              if (cancelled) return;
+              const data = snap.val() || {};
+              const list = Object.keys(data).map(id => ({ id, name: data[id] })).sort((a, b) => a.name.localeCompare(b.name));
+              setStoreDirectory(list);
+              setDirLoading(false);
+              setDirError(false);
+              setDirFromCache(false);
+              setDirBackgroundSync(false); // data terbaru sudah datang, berhenti menandai "menyegarkan"
+              try { localStorage.setItem('tarobun_dir_cache', JSON.stringify(list)); } catch (e) {}
+            })
+            .catch((err) => {
+              if (cancelled) return;
+              setDirErrorDetail(String(err && err.message ? err.message : err));
+              if (attempt < MAX_ATTEMPTS) {
+                setTimeout(tryLoad, 1000 * attempt); // jeda makin lama tiap percobaan ulang
+              } else {
+                setDirBackgroundSync(false);
+                useDirCacheFallback();
+              }
+            });
+        };
+
+        // Kalau semua percobaan koneksi ke database gagal (jaringan benar-benar bermasalah),
+        // jangan langsung "buntu" — pakai daftar toko terakhir yang berhasil dimuat & tersimpan
+        // di HP ini (localStorage), supaya toko/admin tetap bisa mencoba login sambil menunggu
+        // koneksi pulih. Tombol "Muat Ulang" tetap tersedia untuk coba ambil data terbaru lagi.
+        const useDirCacheFallback = () => {
+          setDirLoading(false);
+          try {
+            const cached = JSON.parse(localStorage.getItem('tarobun_dir_cache') || 'null');
+            if (cached && cached.length > 0) {
+              setStoreDirectory(cached);
+              setDirFromCache(true);
+              setDirError(false);
+              return;
+            }
+          } catch (e) {}
+          setDirError(true);
+        };
+
+        const tryAdminCheck = (n) => {
+          __apiFetch(`${WORKER_BASE}/api/admin-exists`)
+            .then(res => { if (!res.ok) throw new Error('admin-exists gagal'); return res.json(); })
+            .then(data => {
+              if (cancelled) return;
+              const exists = data.exists === true;
+              setAdminExists(exists);
+              try { localStorage.setItem('tarobun_admin_exists_cache', JSON.stringify(exists)); } catch (e) {}
+            })
+            .catch(() => {
+              if (cancelled) return;
+              if (n < MAX_ATTEMPTS) {
+                setTimeout(() => tryAdminCheck(n + 1), 1000 * n);
+              } else {
+                try {
+                  const cached = JSON.parse(localStorage.getItem('tarobun_admin_exists_cache') || 'null');
+                  if (cached !== null) { setAdminExists(cached); return; }
+                } catch (e) {}
+                setAdminExists(null);
+                setAdminCheckError(true);
+              }
+            });
+        };
+
+        tryLoad();
+        tryAdminCheck(1);
+
+        return () => {
+          cancelled = true;
+        };
+      }, [reloadTick]);
+
+      // Deteksi koneksi nyata: kalau HP sempat kehilangan sinyal/WiFi lalu nyambung lagi, browser
+      // akan memicu event 'online'. Sebelumnya, kalau error sudah terlanjur muncul, pengguna HARUS
+      // pencet "Muat Ulang" manual walau internetnya sudah pulih. Sekarang begitu koneksi pulih,
+      // otomatis dicoba ulang sendiri tanpa perlu disentuh.
+      useEffect(() => {
+        const handleOnline = () => {
+          if (dirError || adminCheckError) setReloadTick(t => t + 1);
+        };
+        window.addEventListener('online', handleOnline);
+        return () => window.removeEventListener('online', handleOnline);
+      }, [dirError, adminCheckError]);
+
+      // Auto-refresh daftar toko & status admin setiap kali halaman login ini dibuka/dilihat lagi
+      // (misal: admin baru saja membuat cabang baru di tab lain, lalu pindah balik ke tab Login Toko).
+      // Sebelumnya data cuma diambil SEKALI saat halaman pertama dibuka, jadi cabang baru tidak
+      // muncul sampai di-refresh manual. Sekarang otomatis ambil data terbaru tiap tab ini aktif lagi.
+      useEffect(() => {
+        const handleVisible = () => {
+          if (document.visibilityState === 'visible') setReloadTick(t => t + 1);
+        };
+        document.addEventListener('visibilitychange', handleVisible);
+        window.addEventListener('focus', handleVisible);
+        return () => {
+          document.removeEventListener('visibilitychange', handleVisible);
+          window.removeEventListener('focus', handleVisible);
+        };
+      }, []);
+
+      const handleStoreLogin = async (e) => {
+        e.preventDefault();
+        setError('');
+        if (!storeId || !token) { setError('Pilih toko & isi token.'); return; }
+        setLoading(true);
+        try {
+          const email = storeIdToEmail(storeId);
+          const cred = await auth.signInWithEmailAndPassword(email, token);
+          const info = cred.storeInfo;
+          if (!info || info.active === false) {
+            await auth.signOut();
+            setError('Akun toko ini sudah tidak aktif. Hubungi admin.');
+            setLoading(false);
+            return;
+          }
+          saveSession('store', { storeId, storeName: info.name });
+          onLoggedIn({ role: 'store', storeId, storeName: info.name });
+        } catch (err) {
+          // Anti brute-force sepenuhnya ditangani server (lihat catatan KEAMANAN di atas):
+          // kalau terlalu banyak percobaan gagal, server membalas status 429 dengan pesan
+          // sisa waktu kunci -- tampilkan APA ADANYA, jangan diseragamkan.
+          if (err && err.status === 429) {
+            setError(err.message || 'Terlalu banyak percobaan login gagal. Coba lagi beberapa saat lagi.');
+          } else if (err && err.status === 409) {
+            setError(err.message || 'Sudah ada perangkat lain yang sedang aktif memakai akun toko ini.');
+          } else {
+            setError('Nama toko atau token salah.');
+          }
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const handleAdminLogin = async (e) => {
+        e.preventDefault();
+        setError('');
+        setLoading(true);
+        try {
+          if (adminExists === false) {
+            // Setup admin pertama kali
+            if (adminPassword.length < 8) { setError('Password minimal 8 karakter.'); setLoading(false); return; }
+            if (adminPassword !== adminPassword2) { setError('Konfirmasi password tidak cocok.'); setLoading(false); return; }
+            const cred = await auth.createUserWithEmailAndPassword(ADMIN_EMAIL, adminPassword);
+            await restSet(db.ref(`admins/${cred.user.uid}`), true);
+            await restSet(db.ref('meta/adminAccountExists'), true);
+            saveSession('admin', {});
+            onLoggedIn({ role: 'admin' });
+            return;
+          }
+          await auth.signInWithEmailAndPassword(ADMIN_EMAIL, adminPassword);
+          saveSession('admin', {});
+          onLoggedIn({ role: 'admin' });
+        } catch (err) {
+          // Anti brute-force sepenuhnya ditangani server -- lihat catatan KEAMANAN di atas.
+          if (err && err.status === 429) {
+            setError(err.message || 'Terlalu banyak percobaan login gagal. Coba lagi beberapa saat lagi.');
+          } else if (adminExists === false && /sudah/i.test(err.message || '')) {
+            // Server bilang admin sebenarnya sudah ada (flag di sisi ini sempat tidak sinkron,
+            // dan sudah otomatis dibetulkan oleh server barusan) — langsung alihkan ke form Login
+            // supaya pengguna tidak bingung dan tidak coba "buat akun" berulang-ulang.
+            setAdminExists(true);
+            setAdminPassword('');
+            setAdminPassword2('');
+            setError('Akun admin sudah pernah dibuat sebelumnya. Silakan masukkan password admin untuk login.');
+          } else {
+            setError(adminExists === false ? 'Gagal membuat akun admin.' : 'Password admin salah.');
+          }
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-purple-900 via-indigo-900 to-slate-900 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 sm:p-8">
+            <div className="flex flex-col items-center mb-6">
+              <img
+                src="icon-512.png"
+                alt="Logo Tarobun"
+                className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl object-contain shadow-md mb-3"
+              />
+              <h1 className="font-display font-extrabold text-slate-800 text-lg">TAROBUN SO Mandiri Hub</h1>
+              <p className="text-xs text-slate-600 text-center mt-1">Masuk sebagai toko atau admin pusat</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 bg-slate-100 rounded-xl p-1 mb-6">
+              <button onClick={() => { setMode('store'); setError(''); }} className={`py-2 rounded-lg text-sm font-bold transition-all ${mode === 'store' ? 'bg-white shadow text-purple-800' : 'text-slate-500'}`}>Login Toko</button>
+              <button onClick={() => { setMode('admin'); setError(''); }} className={`py-2 rounded-lg text-sm font-bold transition-all ${mode === 'admin' ? 'bg-white shadow text-purple-800' : 'text-slate-500'}`}>Login Admin</button>
+            </div>
+
+            {error && (
+              <div className="bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold rounded-lg px-3 py-2 mb-4">{error}</div>
+            )}
+
+            {dirError && (
+              <div className="bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold rounded-lg px-3 py-2 mb-4 flex items-center justify-between gap-2">
+                <span>Gagal memuat data dari server. Cek koneksi internet Anda.{dirErrorDetail ? ` (Detail: ${dirErrorDetail})` : ''}</span>
+                <button type="button" onClick={() => setReloadTick(t => t + 1)} className="shrink-0 bg-amber-600 text-white text-[10px] font-bold px-2 py-1 rounded-lg">Muat Ulang</button>
+              </div>
+            )}
+
+            {dirFromCache && !dirError && (
+              <div className="bg-sky-50 border border-sky-200 text-sky-700 text-xs font-semibold rounded-lg px-3 py-2 mb-4 flex items-center justify-between gap-2">
+                <span>Koneksi lambat — menampilkan data toko tersimpan (mungkin tidak terbaru).</span>
+                <button type="button" onClick={() => setReloadTick(t => t + 1)} className="shrink-0 bg-sky-600 text-white text-[10px] font-bold px-2 py-1 rounded-lg">Sinkron Ulang</button>
+              </div>
+            )}
+
+            {mode === 'store' ? (
+              <form onSubmit={handleStoreLogin} className="space-y-4">
+                <div ref={storeDropdownRef} className="relative">
+                  <label htmlFor="storeId" className="block text-xs font-semibold text-slate-600 mb-1 flex items-center gap-1.5">
+                    <span>Nama Toko</span>
+                    {dirBackgroundSync && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-normal text-slate-400">
+                        <i data-lucide="loader-2" className="w-3 h-3 animate-spin"></i>
+                        Menyegarkan...
+                      </span>
+                    )}
+                  </label>
+                  {/* Kombobox kustom (bukan <select> polos): daftar toko dibatasi tinggi & bisa
+                      discroll, plus ada kolom pencarian, supaya saat toko banyak tidak langsung
+                      memenuhi layar dan lebih mudah ditemukan. Input tersembunyi 'storeId' tetap
+                      dipertahankan untuk validasi form (required) & submit. */}
+                  <input type="hidden" id="storeId" value={storeId} />
+                  <button
+                    type="button"
+                    disabled={dirLoading}
+                    onClick={() => setStoreDropdownOpen(o => !o)}
+                    className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm bg-white flex items-center justify-between gap-2 disabled:opacity-60 text-left"
+                  >
+                    <span className={`truncate ${selectedStoreName ? 'text-slate-800' : 'text-slate-400'}`}>
+                      {dirLoading ? 'Memuat daftar toko...' : (selectedStoreName || (storeDirectory.length === 0 ? 'Tidak ada toko terdaftar' : '-- Pilih Toko --'))}
+                    </span>
+                    <i data-lucide="chevron-down" className={`w-4 h-4 text-slate-400 shrink-0 transition-transform ${storeDropdownOpen ? 'rotate-180' : ''}`}></i>
+                  </button>
+
+                  {storeDropdownOpen && !dirLoading && (
+                    <div className="absolute z-30 mt-1 w-full bg-white border border-slate-200 rounded-xl shadow-lg animate-fadeIn overflow-hidden">
+                      {storeDirectory.length > 5 && (
+                        <div className="p-2 border-b border-slate-100">
+                          <div className="relative">
+                            <i data-lucide="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"></i>
+                            <input
+                              type="text"
+                              autoFocus
+                              value={storeSearchQuery}
+                              onChange={(e) => setStoreSearchQuery(e.target.value)}
+                              placeholder="Cari nama toko..."
+                              className="w-full pl-8 pr-2.5 py-1.5 border border-slate-300 rounded-lg text-xs"
+                            />
+                          </div>
+                        </div>
+                      )}
+                      <ul className="max-h-56 overflow-y-auto py-1">
+                        {filteredStoreDirectory.length === 0 && (
+                          <li className="px-3 py-2.5 text-xs text-slate-400 text-center">
+                            {storeDirectory.length === 0 ? 'Tidak ada toko terdaftar' : `Tidak ada toko yang cocok dengan "${storeSearchQuery}".`}
+                          </li>
+                        )}
+                        {filteredStoreDirectory.map(s => (
+                          <li key={s.id}>
+                            <button
+                              type="button"
+                              onClick={() => { setStoreId(s.id); setStoreDropdownOpen(false); setStoreSearchQuery(''); }}
+                              className={`w-full text-left px-3 py-2 text-sm truncate ${storeId === s.id ? 'bg-purple-50 text-purple-800 font-semibold' : 'text-slate-700 hover:bg-slate-50'}`}
+                            >
+                              {s.name}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <label htmlFor="token" className="block text-xs font-semibold text-slate-600 mb-1">Token Toko</label>
+                  <input id="token" type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="Masukkan token dari admin" className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required autoComplete="current-password" />
+                </div>
+                <button type="submit" disabled={loading} className="w-full bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 rounded-xl text-sm">
+                  {loading ? 'Memproses...' : 'Masuk sebagai Toko'}
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleAdminLogin} className="space-y-4">
+                {adminExists === false && (
+                  <div className="bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold rounded-lg px-3 py-2">
+                    Belum ada akun admin. Buat password admin pertama kali di bawah ini.
+                  </div>
+                )}
+                {adminCheckError && adminExists === null && (
+                  <div className="bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold rounded-lg px-3 py-2">
+                    Gagal memeriksa status akun admin, tapi Anda tetap bisa mencoba masuk di bawah ini.
+                  </div>
+                )}
+                <div>
+                  <label htmlFor="adminPassword" className="block text-xs font-semibold text-slate-600 mb-1">Password Admin</label>
+                  <input id="adminPassword" type="password" value={adminPassword} onChange={(e) => setAdminPassword(e.target.value)} className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required autoComplete={adminExists === false ? 'new-password' : 'current-password'} minLength={adminExists === false ? 8 : undefined} />
+                </div>
+                {adminExists === false && (
+                  <div>
+                    <label htmlFor="adminPassword2" className="block text-xs font-semibold text-slate-600 mb-1">Konfirmasi Password</label>
+                    <input id="adminPassword2" type="password" value={adminPassword2} onChange={(e) => setAdminPassword2(e.target.value)} className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required minLength={8} />
+                  </div>
+                )}
+                <button type="submit" disabled={loading} className="w-full bg-indigo-900 hover:bg-indigo-950 disabled:opacity-50 text-white font-bold py-3 rounded-xl text-sm">
+                  {loading ? 'Memproses...' : (adminExists === false ? 'Buat Akun Admin' : 'Masuk sebagai Admin')}
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // PANEL ADMIN
+    // ==========================================
+    // Titik indikator status online toko — dipakai di berbagai tempat (kartu daftar toko, chat,
+    // modal detail, monitor kehadiran). Kalau online: titik hijau solid + ripple "ping" melebar-
+    // memudar lembut & perlahan di belakangnya. Kalau offline: titik abu-abu diam saja (animasi
+    // untuk status mati justru membingungkan, jadi sengaja tidak dianimasikan).
+    function PresenceDot({ isOnline, size = 'w-2.5 h-2.5' }) {
+      return (
+        <span className={`relative inline-flex ${size} shrink-0`}>
+          {isOnline && (
+            <span className={`presence-dot-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400`}></span>
+          )}
+          <span className={`relative inline-flex rounded-full ${size} ${isOnline ? 'bg-emerald-500' : 'bg-slate-300'}`}></span>
+        </span>
+      );
+    }
+
+    // Blok skeleton shimmer generik — pengganti teks "Memuat..." polos. `className` menentukan
+    // ukuran/bentuknya (mis. "h-4 w-24" utk baris teks, "h-20 w-20 rounded-full" utk avatar).
+    function Skeleton({ className = '' }) {
+      return <div className={`skeleton ${className}`}></div>;
+    }
+
+    // ==========================================
+    // PEMILIH TOKO DENGAN PENCARIAN (2026-08-06)
+    // ==========================================
+    // Dipakai di semua tempat Admin memilih toko (Update Web, field tambahan Form Builder,
+    // SOP per-toko, dst) — sebelumnya daftar toko ditampilkan PENUH tanpa batas tinggi/pencarian,
+    // jadi merepotkan begitu jumlah toko sudah banyak. Sekarang: ada kotak cari (muncul otomatis
+    // kalau toko lebih dari 5), dan daftarnya dibatasi tinggi + bisa discroll, tidak lagi
+    // menampilkan semua sekaligus memenuhi layar.
+    // mode "chips": tombol bulat kecil (dipakai Form Builder & SOP). mode "checkbox": daftar
+    // dengan checkbox (dipakai Update Web).
+    function StorePicker({ stores, selectedIds, onToggle, onSelectAll, allLabel = 'Semua Toko', mode = 'chips', activeColorClass = 'bg-purple-800 text-white border-purple-800', maxHeight = 'max-h-44' }) {
+      const [query, setQuery] = useState('');
+      const q = query.trim().toLowerCase();
+      const filtered = q ? stores.filter(s => (s.name || '').toLowerCase().includes(q)) : stores;
+
+      return (
+        <div>
+          {stores.length > 5 && (
+            <div className="relative mb-1.5">
+              <i data-lucide="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"></i>
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Cari nama toko..."
+                className="w-full pl-8 pr-2.5 py-1.5 border border-slate-300 rounded-lg text-[11px]"
+              />
+            </div>
+          )}
+          {mode === 'chips' ? (
+            <div className={`flex flex-wrap content-start gap-1.5 ${maxHeight} overflow-y-auto pr-0.5`}>
+              {!q && (
+                <button type="button" onClick={onSelectAll} className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border shrink-0 ${selectedIds.length === 0 ? activeColorClass : 'bg-white text-slate-600 border-slate-300'}`}>
+                  {allLabel}
+                </button>
+              )}
+              {filtered.map(s => (
+                <button
+                  type="button"
+                  key={s.id}
+                  onClick={() => onToggle(s.id)}
+                  className={`px-2.5 py-1 rounded-lg text-[10px] font-bold border shrink-0 ${selectedIds.includes(s.id) ? activeColorClass : 'bg-white text-slate-600 border-slate-300'}`}
+                >
+                  {s.name}
+                </button>
+              ))}
+              {filtered.length === 0 && (
+                <p className="text-[10px] text-slate-400 py-1">Tidak ada toko yang cocok dengan "{query}".</p>
+              )}
+            </div>
+          ) : (
+            <div className={`border border-slate-200 rounded-xl p-3 ${maxHeight} overflow-y-auto space-y-1`}>
+              {stores.length === 0 && <p className="text-xs text-slate-600">Belum ada toko.</p>}
+              {filtered.map(s => (
+                <label key={s.id} className="flex items-center gap-2 text-xs font-semibold text-slate-600 px-1 py-1">
+                  <input type="checkbox" checked={selectedIds.includes(s.id)} onChange={() => onToggle(s.id)} className="rounded" />
+                  {s.name}
+                </label>
+              ))}
+              {filtered.length === 0 && stores.length > 0 && (
+                <p className="text-xs text-slate-400 py-1">Tidak ada toko yang cocok dengan "{query}".</p>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // Skeleton khusus bentuk "Modal Detail Toko" — meniru kerangka konten aslinya (kredensial,
+    // ringkasan angka, daftar laporan) supaya transisi loading→data terasa mulus, bukan lompatan
+    // dari teks "Memuat..." ke layout yang sama sekali berbeda.
+    function StoreDetailSkeleton() {
+      return (
+        <div className="space-y-6 animate-fadeIn">
+          <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+            <Skeleton className="h-4 w-40" />
+            <Skeleton className="h-9 w-full" />
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {[0, 1, 2, 3].map(i => <Skeleton key={i} className="h-16 w-full" />)}
+          </div>
+          <div className="space-y-2">
+            <Skeleton className="h-4 w-32" />
+            {[0, 1, 2].map(i => <Skeleton key={i} className="h-10 w-full" />)}
+          </div>
+        </div>
+      );
+    }
+
+    function AdminPanel({ onLogout }) {
+      const [tab, setTab] = useState('stores');
+      const [showMenu, setShowMenu] = useState(false);
+      const [stores, setStores] = useState([]);
+      const [showAdd, setShowAdd] = useState(false);
+      const [newStoreName, setNewStoreName] = useState('');
+      const [creating, setCreating] = useState(false);
+      const [createdToken, setCreatedToken] = useState(null);
+      const [detailStore, setDetailStore] = useState(null);
+      const [detailData, setDetailData] = useState(null);
+      const [showToken, setShowToken] = useState(false);
+      const [telegramForm, setTelegramForm] = useState({ botToken: '', chatId: '' });
+      const [savingTelegram, setSavingTelegram] = useState(false);
+      const [telegramSaved, setTelegramSaved] = useState(false);
+      const [regeneratingToken, setRegeneratingToken] = useState(false);
+      const [regeneratedToken, setRegeneratedToken] = useState(null);
+      // ===== TAMBAHAN: Admin bisa set token KUSTOM (2026-07-25) =====
+      // Token AWAL saat toko baru dibuat tetap random (lihat handleAddStore / generateSecureToken).
+      // Fitur ini HANYA menambah opsi bagi admin untuk mengganti token toko yang SUDAH ADA
+      // dengan nilai pilihan sendiri (misal biar gampang diingat toko), sebagai ALTERNATIF dari
+      // tombol "Reset Token" yang selalu random. Disimpan lewat path yang SAMA persis dengan
+      // handleRegenerateToken (`stores/{id}/info/token`), jadi TIDAK butuh perubahan di worker.js.
+      const [customTokenInput, setCustomTokenInput] = useState('');
+      const [settingCustomToken, setSettingCustomToken] = useState(false);
+      const [customTokenError, setCustomTokenError] = useState(null);
+      const [formSchemas, setFormSchemas] = useState({ sales: [], inventory: [] });
+      const [newFieldTarget, setNewFieldTarget] = useState('sales');
+      const [newFieldLabel, setNewFieldLabel] = useState('');
+      const [newFieldUnit, setNewFieldUnit] = useState('');
+      const [newFieldType, setNewFieldType] = useState('number');
+      const [newFieldSection, setNewFieldSection] = useState('dough');
+      const [savingField, setSavingField] = useState(false);
+      const [newFieldStoreIds, setNewFieldStoreIds] = useState([]);
+      const toggleNewFieldStore = (storeId) => {
+        setNewFieldStoreIds(prev => prev.includes(storeId) ? prev.filter(id => id !== storeId) : [...prev, storeId]);
+      };
+
+      // ==========================================
+      // UPDATE WEB -> BROADCAST KE BOT TELEGRAM TOKO (STATE)
+      // ==========================================
+      const [webUpdateText, setWebUpdateText] = useState('');
+      const [webUpdateAll, setWebUpdateAll] = useState(true);
+      const [webUpdateStoreIds, setWebUpdateStoreIds] = useState([]);
+      // Pencarian toko di daftar "Pilih Toko" pada tab Chat (list toko sudah bisa discroll,
+      // ini menambahkan kotak cari supaya lebih cepat menemukan toko tertentu).
+      const [chatStoreQuery, setChatStoreQuery] = useState('');
+      const [sendingWebUpdate, setSendingWebUpdate] = useState(false);
+      const [webUpdateReport, setWebUpdateReport] = useState(null); // { success: [], failed: [] }
+      const toggleWebUpdateStore = (storeId) => {
+        setWebUpdateStoreIds(prev => prev.includes(storeId) ? prev.filter(id => id !== storeId) : [...prev, storeId]);
+      };
+
+      // ==========================================
+      // PENGHAPUSAN LAPORAN >=7 HARI (STATE)
+      // ==========================================
+      const [confirmDeleteOldReports, setConfirmDeleteOldReports] = useState(false);
+      const [deletingOldReports, setDeletingOldReports] = useState(false);
+
+      // ==========================================
+      // PENGHAPUSAN 1 LAPORAN / 1 FOTO SECARA INDIVIDUAL (STATE)
+      // ==========================================
+      const [confirmDeleteReport, setConfirmDeleteReport] = useState(null); // { id, tanggal }
+      const [deletingReportId, setDeletingReportId] = useState(null);
+      // FITUR BARU (2026-07-22): Admin bisa lihat & hapus riwayat PO (Pre Order) dan
+      // BAP (Berita Acara Penyesuaian) tiap toko, sama seperti riwayat laporan penjualan.
+      const [confirmDeletePreOrder, setConfirmDeletePreOrder] = useState(null); // { firebaseKey, namaPemesan }
+      const [deletingPreOrderId, setDeletingPreOrderId] = useState(null);
+      const [confirmDeleteBap, setConfirmDeleteBap] = useState(null); // { firebaseKey, tanggal }
+      const [deletingBapId, setDeletingBapId] = useState(null);
+      const [confirmDeleteWasteFoto, setConfirmDeleteWasteFoto] = useState(null); // { firebaseKey, fotoKey, kategori }
+      const [deletingWasteFotoKey, setDeletingWasteFotoKey] = useState(null);
+      // Label ringkas kategori waste, dipakai HANYA untuk teks modal konfirmasi hapus di Panel
+      // Admin (bukan WASTE_CATEGORIES yang ada di komponen Toko — beda komponen, beda scope).
+      const ADMIN_WASTE_LABELS = { bunRijek: 'Bun Rijek', rijekBarang: 'Rijek Barang', bunWaste: 'Bun Waste' };
+
+      // ==========================================
+      // PANDUAN SOP - STATE & LOGIKA (Sisi Admin)
+      // ==========================================
+      const [sopCategories, setSopCategories] = useState([]);
+      const [newSopName, setNewSopName] = useState('');
+      const [newSopContent, setNewSopContent] = useState('');
+      const [newSopStoreIds, setNewSopStoreIds] = useState([]);
+      const [newSopFiles, setNewSopFiles] = useState([]); // File[] dipilih sebelum kategori disimpan
+      const [savingSop, setSavingSop] = useState(false);
+      const [editingSopId, setEditingSopId] = useState(null);
+      const [editSopDraft, setEditSopDraft] = useState(null);
+      const [uploadingSopMedia, setUploadingSopMedia] = useState(null); // catId sedang upload
+      const [confirmDeleteSop, setConfirmDeleteSop] = useState(null);
+
+      const toggleNewSopStore = (storeId) => {
+        setNewSopStoreIds(prev => prev.includes(storeId) ? prev.filter(id => id !== storeId) : [...prev, storeId]);
+      };
+      const toggleEditSopStore = (storeId) => {
+        setEditSopDraft(prev => {
+          const cur = prev.storeIds || [];
+          const next = cur.includes(storeId) ? cur.filter(id => id !== storeId) : [...cur, storeId];
+          return { ...prev, storeIds: next };
+        });
+      };
+      const getSopStoreLabel = (cat) => {
+        if (!cat.storeIds || cat.storeIds.length === 0) return 'Semua Toko';
+        const names = cat.storeIds.map(id => (stores.find(s => s.id === id) || {}).name || id);
+        return names.join(', ');
+      };
+
+      useEffect(() => {
+        const ref = db.ref('sopCategories');
+        const handler = (snap) => {
+          const data = snap.val() || {};
+          const list = Object.keys(data).map(id => {
+            const c = data[id] || {};
+            const media = c.media ? Object.keys(c.media).map(mid => ({ id: mid, ...c.media[mid] })) : [];
+            media.sort((a, b) => (a.addedAt || 0) - (b.addedAt || 0));
+            return { id, name: c.name || '(Tanpa Nama)', content: c.content || '', storeIds: c.storeIds || [], media, createdAt: c.createdAt || 0 };
+          });
+          list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+          setSopCategories(list);
+        };
+        return bindLiveValue(ref, handler);
+      }, []);
+
+      const handleAddSopCategory = async (e) => {
+        e.preventDefault();
+        const name = newSopName.trim();
+        if (!name) return;
+        setSavingSop(true);
+        try {
+          const payload = { name, content: newSopContent.trim(), createdAt: Date.now() };
+          if (newSopStoreIds.length > 0) payload.storeIds = newSopStoreIds;
+          const result = await restPush(db.ref('sopCategories'), payload);
+          const newId = (result && result.name) ? result.name : ('local-' + Date.now());
+          setSopCategories(prev => [...prev, { id: newId, ...payload, storeIds: payload.storeIds || [], media: [] }]);
+          const filesToUpload = newSopFiles;
+          setNewSopName('');
+          setNewSopContent('');
+          setNewSopStoreIds([]);
+          setNewSopFiles([]);
+          if (filesToUpload.length > 0) {
+            await handleUploadSopMedia(newId, filesToUpload);
+          }
+        } catch (err) {
+          console.error(err);
+          alert('Gagal menambah kategori SOP: periksa koneksi internet Anda.');
+        } finally {
+          setSavingSop(false);
+        }
+      };
+
+      const startEditSop = (cat) => {
+        setEditingSopId(cat.id);
+        setEditSopDraft({ name: cat.name, content: cat.content, storeIds: cat.storeIds || [] });
+      };
+      const cancelEditSop = () => { setEditingSopId(null); setEditSopDraft(null); };
+
+      const handleSaveEditSop = async (catId) => {
+        if (!editSopDraft) return;
+        setSavingSop(true);
+        try {
+          const updates = {
+            [`sopCategories/${catId}/name`]: editSopDraft.name.trim(),
+            [`sopCategories/${catId}/content`]: editSopDraft.content.trim(),
+            [`sopCategories/${catId}/storeIds`]: editSopDraft.storeIds.length > 0 ? editSopDraft.storeIds : null,
+          };
+          await restMultiUpdate(updates);
+          setSopCategories(prev => prev.map(c => c.id === catId ? { ...c, name: editSopDraft.name.trim(), content: editSopDraft.content.trim(), storeIds: editSopDraft.storeIds } : c));
+          cancelEditSop();
+        } catch (err) {
+          console.error(err);
+          alert('Gagal menyimpan perubahan SOP: periksa koneksi internet Anda.');
+        } finally {
+          setSavingSop(false);
+        }
+      };
+
+      const handleDeleteSopCategory = async (cat) => {
+        try {
+          await Promise.all((cat.media || []).map(m => deleteSopMediaFile(m.path)));
+          await restRemove(db.ref(`sopCategories/${cat.id}`));
+          setSopCategories(prev => prev.filter(c => c.id !== cat.id));
+          setConfirmDeleteSop(null);
+        } catch (err) {
+          console.error(err);
+          alert('Gagal menghapus kategori SOP: periksa koneksi internet Anda.');
+        }
+      };
+
+      const handleUploadSopMedia = async (catId, fileList) => {
+        const files = Array.from(fileList || []);
+        if (files.length === 0) return;
+        setUploadingSopMedia(catId);
+        try {
+          for (const file of files) {
+            try {
+              const uploaded = await uploadSopMediaFile(catId, file);
+              const result = await restPush(db.ref(`sopCategories/${catId}/media`), { ...uploaded, addedAt: Date.now() });
+              const mediaId = (result && result.name) ? result.name : ('local-' + Date.now());
+              setSopCategories(prev => prev.map(c => c.id === catId ? { ...c, media: [...c.media, { id: mediaId, ...uploaded, addedAt: Date.now() }] } : c));
+            } catch (fileErr) {
+              console.error(fileErr);
+              alert(`Gagal upload "${file.name}": ${fileErr.message || 'periksa koneksi internet Anda'}`);
+            }
+          }
+        } finally {
+          setUploadingSopMedia(null);
+        }
+      };
+
+      const handleDeleteSopMedia = async (catId, media) => {
+        try {
+          await restRemove(db.ref(`sopCategories/${catId}/media/${media.id}`));
+          setSopCategories(prev => prev.map(c => c.id === catId ? { ...c, media: c.media.filter(m => m.id !== media.id) } : c));
+          deleteSopMediaFile(media.path);
+        } catch (err) {
+          console.error(err);
+          alert('Gagal menghapus file: periksa koneksi internet Anda.');
+        }
+      };
+
+      // Daftar bagian/section pada form SO Stok (Inventory) toko, supaya field tambahan yang
+      // dibuat Admin bisa langsung ditaruh di bagian yang sesuai (bukan hanya numpuk di bawah).
+      const INVENTORY_FORM_SECTIONS = [
+        { value: 'dough', label: 'Frozen Dough & Fillings' },
+        { value: 'ingredients', label: 'Ingredients & Powder' },
+        { value: 'packaging', label: 'Packaging & Operations' },
+        { value: 'lainnya', label: 'Lainnya (Data Tambahan)' },
+      ];
+      const getInventorySectionLabel = (value) => (INVENTORY_FORM_SECTIONS.find(s => s.value === value) || {}).label || 'Lainnya (Data Tambahan)';
+      // Label ringkas untuk menampilkan target toko sebuah field custom di daftar Form Builder.
+      const getFieldStoreLabel = (field) => {
+        if (!field.storeIds || field.storeIds.length === 0) return 'Semua Toko';
+        const names = field.storeIds.map(id => (stores.find(s => s.id === id) || {}).name || id);
+        return names.join(', ');
+      };
+
+      useEffect(() => {
+        const ref = db.ref('formSchemas');
+        const handler = (snap) => {
+          const data = snap.val() || {};
+          const toList = (obj) => Object.keys(obj || {}).map(id => ({ id, ...obj[id] }));
+          setFormSchemas({ sales: toList(data.sales), inventory: toList(data.inventory) });
+        };
+        return bindLiveValue(ref, handler);
+      }, []);
+
+      const handleAddFormField = async (e) => {
+        e.preventDefault();
+        const label = newFieldLabel.trim();
+        if (!label) return;
+        setSavingField(true);
+        try {
+          const fieldData = { label, unit: newFieldUnit.trim(), type: newFieldType };
+          if (newFieldTarget === 'inventory') fieldData.section = newFieldSection;
+          // storeIds hanya disertakan kalau admin memilih toko tertentu. Kalau kosong (tidak
+          // dicentang satu pun / mode "Semua Toko"), properti ini TIDAK ditulis sama sekali
+          // supaya field otomatis berlaku ke semua toko (termasuk toko baru di masa depan).
+          if (newFieldStoreIds.length > 0) fieldData.storeIds = newFieldStoreIds;
+          const result = await restPush(db.ref(`formSchemas/${newFieldTarget}`), fieldData);
+          const newId = (result && result.name) ? result.name : ('local-' + Date.now());
+          setFormSchemas(prev => ({ ...prev, [newFieldTarget]: [...(prev[newFieldTarget] || []), { id: newId, ...fieldData }] }));
+          setNewFieldLabel('');
+          setNewFieldUnit('');
+          setNewFieldStoreIds([]);
+        } catch (err) {
+          console.error(err);
+        } finally {
+          setSavingField(false);
+        }
+      };
+
+      const handleDeleteFormField = async (target, id) => {
+        try {
+          await restRemove(db.ref(`formSchemas/${target}/${id}`));
+          setFormSchemas(prev => ({ ...prev, [target]: (prev[target] || []).filter(f => f.id !== id) }));
+        } catch (err) {
+          console.error(err);
+        }
+      };
+      const [detailLoading, setDetailLoading] = useState(false);
+      const [confirmDelete, setConfirmDelete] = useState(null);
+      const [activeChatStore, setActiveChatStore] = useState(null);
+      // isFirstTime: true kalau flag 'tarobun_onboarding_admin' belum pernah diset di localStorage
+      // perangkat ini -> tur onboarding otomatis jalan. Setelah tur selesai, pop-up peringatan wajib
+      // ditampilkan sebelum benar-benar ditutup.
+      const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem('tarobun_onboarding_admin'));
+      const [showMandatoryChecklist, setShowMandatoryChecklist] = useState(false);
+
+      // Onboarding hanya perlu muncul sekali seumur akun, bukan sekali per-browser/HP. Cek juga
+      // penanda di Firebase supaya kalau admin login dari HP/browser lain, tidak muncul lagi.
+      useEffect(() => {
+        const uid = auth.currentUser && auth.currentUser.uid;
+        if (!uid) return;
+        restOnce(db.ref(`admins/${uid}/onboardingSeen`)).then(snap => {
+          if (snap.val() === true) {
+            localStorage.setItem('tarobun_onboarding_admin', '1');
+            setShowOnboarding(false);
+          }
+        }).catch(() => {});
+      }, []);
+
+      const finishAdminOnboarding = () => {
+        localStorage.setItem('tarobun_onboarding_admin', '1');
+        const uid = auth.currentUser && auth.currentUser.uid;
+        if (uid) restSet(db.ref(`admins/${uid}/onboardingSeen`), true).catch(() => {});
+        setShowOnboarding(false);
+        setShowMenu(false);
+        setShowMandatoryChecklist(true);
+      };
+      const [errorMsg, setErrorMsg] = useState('');
+      const [adminToast, setAdminToast] = useState(null);
+      const [unreadByStore, setUnreadByStore] = useState({});
+      const [chatListenerError, setChatListenerError] = useState(null);
+      // Status izin notifikasi browser, ditampilkan supaya admin tahu kalau notifikasi belum aktif
+      // (banyak browser DIAM-DIAM menolak permintaan izin otomatis kalau tidak dipicu klik langsung,
+      // jadi requestNotificationPermission() di useEffect saja kadang tidak cukup).
+      const [notifPermission, setNotifPermission] = useState(
+        typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'
+      );
+      const handleEnableNotif = () => {
+        if (isNativeApp()) {
+          registerNativePush();
+          showAdminToast('🔔 Meminta izin notifikasi...');
+          return;
+        }
+        if (typeof Notification === 'undefined') return;
+        try {
+          // Sama seperti requestNotificationPermission(): panggilan ini bisa melempar
+          // SecurityError secara sinkron di browser/WebView yang memblokir fitur
+          // Notifikasi, jadi try/catch di luar tetap perlu walau sudah ada .catch().
+          Notification.requestPermission().then((perm) => {
+            setNotifPermission(perm);
+            if (perm === 'granted') {
+              showAdminToast('🔔 Notifikasi browser diaktifkan');
+              playNotificationSound();
+            }
+          }).catch(() => {});
+        } catch (err) {
+          showAdminToast('⚠️ Browser ini tidak mendukung notifikasi');
+        }
+      };
+
+      const showAdminToast = (message) => {
+        setAdminToast(message);
+        setTimeout(() => setAdminToast(null), 4000);
+      };
+
+      useEffect(() => {
+        scheduleLucideIcons();
+      });
+
+      // Data toko: dulu pakai db.ref('stores') yang membaca SELURUH data semua toko
+      // (termasuk histori, foto waste, dst — bukan cuma info dasarnya). Sekarang pakai
+      // /api/stores-summary yang HANYA membaca stores/{id}/info per toko (kecil &
+      // bertarget) — lihat catatan detail di worker.js.
+      useEffect(() => {
+        let stopped = false;
+        const poll = async () => {
+          if (stopped) return;
+          if (!document.hidden) {
+            try {
+              const res = await __apiFetch(`${WORKER_BASE}/api/stores-summary`, { headers: __authHeaders() });
+              const data = await res.json();
+              const map = data.stores || {};
+              const list = Object.keys(map).map(id => ({ id, ...map[id] })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+              if (!stopped) setStores(list);
+            } catch (e) { /* coba lagi di poll berikutnya */ }
+          }
+          if (!stopped) setTimeout(poll, LIVE_POLL_INTERVAL_MS);
+        };
+        poll();
+        return () => { stopped = true; };
+      }, []);
+
+      // ==========================================
+      // MONITOR KEHADIRAN CABANG (Real-time Presence)
+      // ==========================================
+      const [storesPresence, setStoresPresence] = useState({});
+      useEffect(() => {
+        // OPTIMASI (2026-07-19): sebelumnya lewat db.ref('storesPresence').on(...) yang
+        // numpang ke D1 (rtdb generic path) tiap 15 detik. Sekarang presence sepenuhnya
+        // ditangani Durable Object (0 Rows D1), jadi aman di-poll lebih sering (8 detik)
+        // untuk status online/offline yang terasa lebih real-time, tanpa risiko kena limit.
+        let stopped = false;
+        const poll = async () => {
+          if (stopped) return;
+          if (!document.hidden) {
+            try {
+              const res = await __apiFetch(`${WORKER_BASE}/api/presence/status`, { headers: __authHeaders() });
+              const data = await res.json();
+              if (!stopped) setStoresPresence(data || {});
+            } catch (e) { /* diam-diam, coba lagi di poll berikutnya */ }
+          }
+          if (!stopped) setTimeout(poll, 8000);
+        };
+        poll();
+        return () => { stopped = true; };
+      }, []);
+
+      // Status online dihitung dari KESEGARAN heartbeat (lastSeen), bukan cuma dari
+      // flag isOnline yang tersimpan — supaya kalau toko menutup tab tiba-tiba
+      // (tanpa sempat kirim status offline), Admin tetap otomatis melihatnya berubah
+      // jadi Offline begitu heartbeat terakhirnya kedaluwarsa, tanpa perlu refresh
+      // manual. Timer ini memaksa re-render tiap 10 detik supaya perhitungan
+      // "kedaluwarsa" itu ikut ter-update walau tidak ada data baru dari Firebase.
+      const [, forcePresenceTick] = useState(0);
+      useEffect(() => {
+        const t = setInterval(() => forcePresenceTick(x => x + 1), 10000);
+        return () => clearInterval(t);
+      }, []);
+      const isStoreOnline = (presence) => !!(
+        presence && presence.isOnline && presence.lastSeen &&
+        (Date.now() - presence.lastSeen) < PRESENCE_ONLINE_TIMEOUT_MS
+      );
+
+      // ==========================================
+      // MENU "PERANGKAT" — monitor device login per toko + logout paksa (2026-08-06)
+      // ==========================================
+      // Menggantikan aturan lama "maks 2 device/toko" (sudah dihapus di worker.js): sekarang
+      // toko boleh login di berapa pun device sekaligus, dan menu ini murni untuk MEMANTAU
+      // device apa saja yang sedang login, plus tombol logout paksa untuk device yang
+      // dianggap tidak dikenali/mencurigakan. Hanya di-poll saat tab "Perangkat" sedang dibuka
+      // supaya tidak menambah beban request kalau Admin sedang di menu lain.
+      const [devicesData, setDevicesData] = useState({}); // { storeId: [{deviceId, deviceLabel, loginAt, lastSeen, isActive}, ...] }
+      const [loadingDevices, setLoadingDevices] = useState(false);
+      const [kickingDevice, setKickingDevice] = useState(null); // `${storeId}::${deviceId}` yang sedang diproses
+
+      const loadDevices = async () => {
+        setLoadingDevices(true);
+        try {
+          const res = await __apiFetch(`${WORKER_BASE}/api/admin/devices`, { headers: __authHeaders() });
+          const data = await res.json();
+          setDevicesData(data || {});
+        } catch (e) {
+          console.error('Gagal memuat data perangkat:', e);
+        } finally {
+          setLoadingDevices(false);
+        }
+      };
+
+      useEffect(() => {
+        if (tab !== 'devices') return;
+        let stopped = false;
+        const poll = async () => {
+          if (stopped) return;
+          if (!document.hidden) await loadDevices();
+          if (!stopped) setTimeout(poll, 15000);
+        };
+        poll();
+        return () => { stopped = true; };
+      }, [tab]);
+
+      const handleKickDevice = async (storeId, deviceId, deviceLabel) => {
+        const ok = window.confirm(`Logout paksa perangkat "${deviceLabel || deviceId.slice(0, 8)}" dari toko ini?\n\nDevice tersebut akan otomatis ter-logout pada heartbeat berikutnya (maks ±1 menit).`);
+        if (!ok) return;
+        const key = `${storeId}::${deviceId}`;
+        setKickingDevice(key);
+        try {
+          await __apiFetch(`${WORKER_BASE}/api/admin/devices/kick`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ storeId, deviceId }),
+          });
+          setDevicesData(prev => ({ ...prev, [storeId]: (prev[storeId] || []).filter(d => d.deviceId !== deviceId) }));
+        } catch (e) {
+          console.error(e);
+          alert('Gagal logout paksa perangkat. Cek koneksi internet.');
+        } finally {
+          setKickingDevice(null);
+        }
+      };
+
+      // Live-update untuk modal detail toko. Sebelumnya pakai once('value') sehingga data (riwayat,
+      // foto rijek, Telegram) di modal TIDAK otomatis ter-refresh selagi modal terbuka — admin harus
+      // tutup lalu buka lagi untuk lihat laporan terbaru. Sekarang pakai listener realtime (.on) supaya
+      // otomatis ter-update sendiri begitu ada laporan/foto baru masuk dari toko.
+      useEffect(() => {
+        if (!detailStore) return;
+        setDetailData(null);
+        setDetailLoading(true);
+        const storeId = detailStore.id;
+        const historyRef = db.ref(`stores/${storeId}/history`).limitToLast(150);
+        const wasteRef = db.ref(`stores/${storeId}/wasteFotos`).limitToLast(150);
+        const tgRef = db.ref(`stores/${storeId}/telegramConfig`);
+        const preOrderRef = db.ref(`stores/${storeId}/preOrders`).limitToLast(150);
+        const bapRef = db.ref(`stores/${storeId}/bapReports`).limitToLast(150);
+
+        let historyList = [];
+        let wasteList = [];
+        let preOrderList = [];
+        let bapList = [];
+        let gotHistory = false, gotWaste = false, gotPreOrder = false, gotBap = false;
+
+        const pushUpdate = () => {
+          if (gotHistory && gotWaste && gotPreOrder && gotBap) {
+            setDetailData({ historyList, wasteList, preOrderList, bapList });
+            setDetailLoading(false);
+          }
+        };
+        const historyHandler = (snap) => {
+          const data = snap.val() || {};
+          // BUGFIX (2026-07-20): sebelumnya `{ id: key, ...data[key] }` — karena field
+          // `id` di dalam payload (lihat handleSaveToDevice: `id: Date.now().toString()`)
+          // ikut ter-spread SETELAH `id: key`, field itu MENIMPA `id: key`. Akibatnya
+          // `h.id` yang dipakai untuk hapus laporan bukan key asli di database (yang
+          // sebenarnya = tanggal, mis. "2026-07-20"), melainkan id internal yang salah —
+          // sehingga tombol hapus laporan selalu menghapus path yang TIDAK ADA (sukses
+          // tanpa efek, laporan aslinya tidak pernah kehapus). Taruh `id: key` SETELAH
+          // spread supaya key asli selalu menang.
+          historyList = Object.keys(data).map(key => ({ ...data[key], id: key })).sort((a, b) => (b.tanggal || '').localeCompare(a.tanggal || ''));
+          gotHistory = true;
+          pushUpdate();
+        };
+        const wasteHandler = (snap) => {
+          const data = snap.val() || {};
+          wasteList = Object.keys(data).map(key => ({ firebaseKey: key, ...data[key] })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          gotWaste = true;
+          pushUpdate();
+        };
+        const tgHandler = (snap) => {
+          const tg = snap.val() || {};
+          setTelegramForm({ botToken: tg.botToken || '', chatId: tg.chatId || '' });
+        };
+        const preOrderHandler = (snap) => {
+          const data = snap.val() || {};
+          preOrderList = Object.keys(data).map(key => ({ firebaseKey: key, ...data[key] })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          gotPreOrder = true;
+          pushUpdate();
+        };
+        const bapHandler = (snap) => {
+          const data = snap.val() || {};
+          bapList = Object.keys(data).map(key => ({ firebaseKey: key, ...data[key] })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          gotBap = true;
+          pushUpdate();
+        };
+
+        const unbindHistory = bindLiveValue(historyRef, historyHandler);
+        const unbindWaste = bindLiveValue(wasteRef, wasteHandler);
+        const unbindTg = bindLiveValue(tgRef, tgHandler);
+        const unbindPreOrder = bindLiveValue(preOrderRef, preOrderHandler);
+        const unbindBap = bindLiveValue(bapRef, bapHandler);
+
+        return () => {
+          unbindHistory();
+          unbindWaste();
+          unbindTg();
+          unbindPreOrder();
+          unbindBap();
+        };
+      }, [detailStore && detailStore.id]);
+
+      // Bersihkan otomatis data seluruh toko yang usianya lebih dari 30 hari setiap kali admin membuka panel.
+      // Ini pelengkap pembersihan di sisi toko, memastikan data tetap ringan walau toko jarang login.
+      // Dibatasi maksimal 1x per 24 jam (lihat shouldRunPruneNow) — tidak perlu baca ulang
+      // SELURUH riwayat 100 toko setiap kali admin refresh/buka dashboard di hari yang sama.
+      useEffect(() => {
+        if (stores.length === 0) return;
+        if (!shouldRunPruneNow('admin_bulk')) return;
+        stores.forEach((store) => {
+          const base = `stores/${store.id}`;
+          pruneOldEntries(db.ref(`${base}/history`), (item) => item.tanggal ? new Date(item.tanggal).getTime() : (item.createdAt || 0));
+          pruneOldEntries(db.ref(`${base}/wasteFotos`), (item) => item.createdAt || (item.tanggal ? new Date(item.tanggal).getTime() : 0), (item) => item.fotoKey ? [item.fotoKey] : []);
+          pruneOldEntries(db.ref(`${base}/kedatanganBarang`), (item) => item.createdAt || (item.tanggal ? new Date(item.tanggal).getTime() : 0));
+          // Chat sudah tidak lewat rtdb generic path lagi (pindah ke /api/chat, D1) — retensi
+          // 30 harinya sekarang otomatis di server (lihat worker.js), jadi baris prune di sini
+          // sudah tidak relevan lagi dan dihapus.
+        });
+      }, [stores.length]);
+
+      // Notifikasi pesan chat baru dari toko manapun (badge merah per toko + toast + notifikasi browser)
+      const activeChatStoreRef = React.useRef(null);
+      useEffect(() => { activeChatStoreRef.current = activeChatStore; }, [activeChatStore]);
+      const tabRef = React.useRef(tab);
+      useEffect(() => { tabRef.current = tab; }, [tab]);
+      const adminChatInitRef = React.useRef(false);
+      const adminLastSeenMsgRef = React.useRef({});
+      // Simpan daftar toko terbaru lewat ref (bukan langsung dipakai sebagai dependency listener
+      // di bawah). Sebelumnya listener chat ini dipasang ulang (unsubscribe lalu subscribe lagi ke
+      // Firebase) SETIAP KALI array "stores" berubah referensinya — termasuk saat data toko lain
+      // diperbarui tanpa ada hubungannya dengan chat. Ini yang membuat notifikasi terasa TIDAK
+      // real-time (koneksi sempat putus-sambung berkali-kali) dan kadang nama toko yang tampil di
+      // notifikasi belum ter-update. Dengan ref ini, listener chat cukup dipasang SATU KALI saja
+      // dan tetap menyala terus, tapi selalu memakai data nama toko yang paling baru.
+      const storesRef = React.useRef(stores);
+      useEffect(() => { storesRef.current = stores; }, [stores]);
+      useEffect(() => {
+        // OPTIMASI KRITIS (2026-07-19): sebelumnya listener ini baca db.ref('chats') —
+        // SELURUH riwayat pesan SEMUA toko — tiap 15 detik, cuma buat hitung badge unread.
+        // Untuk 100 toko dengan histori 30 hari, ini bisa belasan JUTA rows read/hari
+        // SENDIRIAN. Sekarang cukup poll /api/chat/summary: ~1 baris ringkas PER TOKO
+        // (bukan per pesan), jadi maksimal ~100 baris dibaca per poll, seberapa pun
+        // panjang riwayat pesan sebenarnya.
+        let stopped = false;
+        const refreshSummary = async () => {
+          if (stopped) return;
+          try {
+            const res = await __apiFetch(`${WORKER_BASE}/api/chat/summary`, { headers: __authHeaders() });
+            const data = await res.json();
+            const summaryMap = data.summary || {};
+            const counts = {};
+            Object.keys(summaryMap).forEach((sid) => {
+              const s = summaryMap[sid];
+              if (s.unread_for_admin > 0) counts[sid] = s.unread_for_admin;
+
+              if (adminChatInitRef.current && s.last_sender === 'store' && s.last_message_id !== adminLastSeenMsgRef.current[sid]) {
+                const storeName = (storesRef.current.find(x => x.id === sid) || {}).name || sid;
+                const isViewingThisChat = tabRef.current === 'chat' && activeChatStoreRef.current && activeChatStoreRef.current.id === sid;
+                if (!isViewingThisChat) {
+                  showAdminToast(`💬 Pesan baru dari ${storeName}: "${(s.last_text || '').slice(0, 60)}${(s.last_text || '').length > 60 ? '…' : ''}"`);
+                }
+                playNotificationSound();
+                sendBrowserNotification(`Pesan baru dari ${storeName}`, s.last_text || '');
+              }
+              if (s.last_message_id) adminLastSeenMsgRef.current[sid] = s.last_message_id;
+            });
+            if (!stopped) {
+              setUnreadByStore(counts);
+              adminChatInitRef.current = true;
+              setChatListenerError(null);
+            }
+          } catch (err) {
+            console.error('Gagal memuat ringkasan chat untuk notifikasi admin:', err);
+            if (!stopped) setChatListenerError('Gagal memuat notifikasi chat. Coba refresh halaman.');
+          }
+        };
+        refreshSummary(); // muat langsung saat pertama render
+        // REAL-TIME (bukan lagi nunggu 15 detik): begitu toko manapun kirim pesan, worker
+        // langsung "membangunkan" long-poll ini lewat ChatHub, lalu kita refresh ringkasan
+        // (murah, ~1 baris per toko) untuk update badge + toast + suara.
+        const poller = createChatLongPoll({ storeId: null, onChange: refreshSummary });
+        // Jaring pengaman: tetap refresh berkala (jarang, 60 detik) untuk jaga-jaga kalau
+        // Durable Object sempat direstart Cloudflare dan "kelewat" 1 momen bangun-tidur.
+        const safetyInterval = setInterval(refreshSummary, 60000);
+        return () => { stopped = true; poller.stop(); clearInterval(safetyInterval); };
+      }, []);
+
+      const totalAdminUnread = Object.values(unreadByStore).reduce((a, b) => a + b, 0);
+
+      const handleAddStore = async (e) => {
+        e.preventDefault();
+        setErrorMsg('');
+        const name = newStoreName.trim();
+        if (!name) return;
+        setCreating(true);
+        try {
+          const id = `${slugify(name)}-${Date.now().toString(36)}`;
+          const tokenVal = generateSecureToken(16);
+          const email = storeIdToEmail(id);
+          // Gunakan instance kedua supaya sesi admin tidak ikut tergantikan
+          const cred = await secondaryAuth.createUserWithEmailAndPassword(email, tokenVal);
+          const uid = cred.user.uid;
+          await secondaryAuth.signOut();
+
+          await restMultiUpdate({
+            [`stores/${id}/info`]: { name, uid, createdAt: Date.now(), active: true, token: tokenVal },
+            [`storeUidMap/${uid}`]: id,
+            [`storeDirectory/${id}`]: name,
+          });
+
+          setCreatedToken({ id, name, token: tokenVal });
+          setNewStoreName('');
+          setShowAdd(false);
+          // Langsung muncul di daftar toko admin, tidak perlu refresh manual.
+          setStores(prev => [{ id, name, uid, createdAt: Date.now(), active: true, token: tokenVal }, ...prev]);
+        } catch (err) {
+          console.error(err);
+          setErrorMsg('Gagal membuat toko: ' + (err && err.message ? err.message : 'periksa koneksi internet Anda') + '. Silakan coba lagi — kalau ini muncul, toko BELUM tersimpan sama sekali (bukan setengah tersimpan).');
+        } finally {
+          setCreating(false);
+        }
+      };
+
+      const openDetail = (store) => {
+        setDetailStore(store);
+        setShowToken(false);
+        setTelegramSaved(false);
+        setRegeneratedToken(null);
+        setCustomTokenInput('');
+        setCustomTokenError(null);
+        // Data (riwayat, foto rijek, Telegram) diambil otomatis & realtime oleh useEffect di atas.
+      };
+
+      // Simpan Bot Token & Chat ID Telegram khusus toko ini. Hanya admin yang bisa mengatur ini —
+      // sisi toko tidak lagi punya form untuk mengedit integrasi Telegram.
+      const handleSaveTelegramConfig = async () => {
+        if (!detailStore) return;
+        setSavingTelegram(true);
+        setTelegramSaved(false);
+        try {
+          await restSet(db.ref(`stores/${detailStore.id}/telegramConfig`), {
+            botToken: telegramForm.botToken.trim(),
+            chatId: telegramForm.chatId.trim(),
+          });
+          setTelegramSaved(true);
+          setTimeout(() => setTelegramSaved(false), 3000);
+        } catch (err) {
+          console.error(err);
+        } finally {
+          setSavingTelegram(false);
+        }
+      };
+
+      // Escape karakter spesial Telegram Markdown (legacy) khusus untuk pesan broadcast Update Web.
+      const escapeMdWebUpdate = (text) => String(text === null || text === undefined ? '' : text).replace(/([_*`\[])/g, '\\$1');
+
+      // ==========================================
+      // FITUR: BROADCAST UPDATE WEB -> BOT TELEGRAM TOKO
+      // ==========================================
+      // Admin mengetik satu pesan, memilih toko tujuan (semua atau beberapa saja), lalu setiap
+      // toko terpilih menerima pesan tersebut lewat Bot Telegram masing-masing (Bot Token & Chat ID
+      // yang sudah diatur admin di menu Kelola Toko). Bot Token/Chat ID diambil langsung dari Cloud
+      // saat pengiriman (bukan dari state lokal), supaya selalu memakai integrasi Telegram terbaru.
+      const handleSendWebUpdate = async () => {
+        const message = webUpdateText.trim();
+        if (!message) return;
+        const targets = webUpdateAll ? stores : stores.filter(s => webUpdateStoreIds.includes(s.id));
+        if (targets.length === 0) {
+          showAdminToast('⚠️ Pilih minimal satu toko tujuan.');
+          return;
+        }
+        setSendingWebUpdate(true);
+        setWebUpdateReport(null);
+        const success = [];
+        const failed = [];
+        for (const store of targets) {
+          try {
+            const snap = await restOnce(db.ref(`stores/${store.id}/telegramConfig`));
+            const tg = snap.val() || {};
+            const token = (tg.botToken || '').trim();
+            const chatId = (tg.chatId || '').trim();
+            if (!token || !chatId) {
+              failed.push(`${store.name} (Bot Telegram belum diatur)`);
+              continue;
+            }
+            const text = `*📢 UPDATE SISTEM WEB TAROBUN*\n\n${escapeMdWebUpdate(message)}`;
+            // PERBAIKAN: kode lama mengecek `response.ok` (status HTTP fetch), padahal Telegram
+            // API sering membalas HTTP 200 tetap tapi dengan body `{ ok: false, description }`
+            // untuk kasus gagal (mis. bot diblokir user, chat_id salah). Akibatnya pengiriman yang
+            // sebenarnya DITOLAK Telegram tetap tercatat "berhasil". Sekarang pakai helper terpusat
+            // yang benar-benar memeriksa `result.ok` dari body JSON Telegram.
+            const res = await sendTelegramMessage(token, chatId, text);
+            if (res.ok) success.push(store.name);
+            else failed.push(`${store.name} (${res.error})`);
+          } catch (err) {
+            console.error('Gagal kirim Update Web ke toko:', store.name, err);
+            failed.push(store.name);
+          }
+        }
+        setWebUpdateReport({ success, failed });
+
+        // Simpan juga ke database agar Toko yang online menerima pop-up real-time.
+        // BUGFIX (2026-07-20): sebelumnya path ini SATU untuk semua toko dan TIDAK menyimpan
+        // toko mana saja yang jadi tujuan, padahal Telegram di atas SUDAH benar hanya
+        // mengirim ke toko yang dipilih (`targets`). Akibatnya pop-up real-time di web tetap
+        // muncul di SEMUA toko walau admin cuma memilih sebagian. Fix: simpan juga daftar
+        // storeId tujuan (`targetStoreIds` = null berarti untuk SEMUA toko), dan sisi Toko
+        // (lihat listener systemUpdates/latest di StoreApp) memeriksa dulu apakah storeId-nya
+        // ada di daftar itu sebelum menampilkan pop-up.
+        try {
+          await restSet(db.ref('systemUpdates/latest'), {
+            id: Date.now().toString(),
+            text: message,
+            timestamp: Date.now(),
+            targetStoreIds: webUpdateAll ? null : targets.map(s => s.id),
+          });
+        } catch (err) {
+          console.error('Gagal menyimpan Update Web ke database:', err);
+        }
+
+        setSendingWebUpdate(false);
+        if (success.length > 0) {
+          showAdminToast(`✅ Update Web terkirim ke ${success.length} toko.`);
+          setWebUpdateText('');
+        }
+      };
+
+      // ==========================================
+      // FITUR: PENGHAPUSAN LAPORAN >=7 HARI + NOTIFIKASI TOKO
+      // ==========================================
+      // Menghapus entri "Riwayat Penjualan & Stok" (stores/{id}/history) milik toko yang sedang
+      // dibuka di modal detail, yang usianya sudah 7 hari atau lebih (dihitung dari field "tanggal").
+      // Setelah terhapus, sistem otomatis mengirim notifikasi ke toko lewat Chat aplikasi (toko akan
+      // langsung dapat toast + suara + notifikasi browser seperti pesan chat admin biasa), supaya
+      // toko tahu laporan lamanya sudah dibersihkan oleh Admin.
+      const REPORT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 hari
+      const getOldReportEntries = (historyList) => {
+        const cutoff = Date.now() - REPORT_RETENTION_MS;
+        return (historyList || []).filter(h => {
+          const ts = h.tanggal ? new Date(h.tanggal).getTime() : (h.createdAt || 0);
+          return ts && ts < cutoff;
+        });
+      };
+
+      const handleDeleteOldReports = async () => {
+        if (!detailStore || !detailData) return;
+        const oldEntries = getOldReportEntries(detailData.historyList);
+        if (oldEntries.length === 0) {
+          setConfirmDeleteOldReports(false);
+          return;
+        }
+        setDeletingOldReports(true);
+        try {
+          const updates = {};
+          oldEntries.forEach(h => { updates[`stores/${detailStore.id}/history/${h.id}`] = null; });
+          await restMultiUpdate(updates);
+
+          // Kirim notifikasi otomatis ke toko lewat Chat, sebagai pemberitahuan laporan 7 hari lalu
+          // telah dibersihkan oleh Admin.
+          const notifText = `🧹 ${oldEntries.length} laporan penjualan & stok yang usianya sudah 7 hari atau lebih telah dibersihkan oleh Admin dari sistem, untuk menjaga performa aplikasi.`;
+          await __apiFetch(`${WORKER_BASE}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ storeId: detailStore.id, senderLabel: 'Sistem (Otomatis)', text: notifText }),
+          });
+
+          setConfirmDeleteOldReports(false);
+          showAdminToast(`🧹 ${oldEntries.length} laporan lama toko "${detailStore.name}" dihapus & toko sudah diberi tahu.`);
+        } catch (err) {
+          console.error('Gagal menghapus laporan lama:', err);
+          const detail = (err && err.message) ? err.message : 'Kesalahan tidak diketahui';
+          alert(`Gagal menghapus laporan lama: ${detail}`);
+        } finally {
+          setDeletingOldReports(false);
+        }
+      };
+
+      // Hapus SATU laporan penjualan/stok tertentu (bukan massal ≥7 hari). Laporan ini tidak
+      // menyimpan foto (hanya angka penjualan/stok), jadi cukup hapus baris DB-nya saja.
+      const handleDeleteSingleReport = async () => {
+        if (!detailStore || !confirmDeleteReport) return;
+        setDeletingReportId(confirmDeleteReport.id);
+        try {
+          await restRemove(db.ref(`stores/${detailStore.id}/history/${confirmDeleteReport.id}`));
+          setConfirmDeleteReport(null);
+          showAdminToast(`🗑️ Laporan tanggal ${confirmDeleteReport.tanggal} berhasil dihapus.`);
+        } catch (err) {
+          console.error('Gagal menghapus laporan:', err);
+          const detail = (err && err.message) ? err.message : 'Kesalahan tidak diketahui';
+          alert(`Gagal menghapus laporan: ${detail}`);
+        } finally {
+          setDeletingReportId(null);
+        }
+      };
+
+      // Hapus SATU entri Pre Order (PO) tertentu. Foto bukti bayar PO tersimpan di R2 (buktiKey),
+      // jadi selain hapus baris DB, file di R2 juga ikut dihapus permanen.
+      const handleDeleteSinglePreOrder = async () => {
+        if (!detailStore || !confirmDeletePreOrder) return;
+        setDeletingPreOrderId(confirmDeletePreOrder.firebaseKey);
+        try {
+          await restRemove(db.ref(`stores/${detailStore.id}/preOrders/${confirmDeletePreOrder.firebaseKey}`));
+          if (confirmDeletePreOrder.buktiKey) {
+            await deleteMediaFromR2(confirmDeletePreOrder.buktiKey).catch(() => {});
+          }
+          setConfirmDeletePreOrder(null);
+          showAdminToast(`🗑️ PO atas nama "${confirmDeletePreOrder.namaPemesan || '-'}" berhasil dihapus.`);
+        } catch (err) {
+          console.error('Gagal menghapus PO:', err);
+          const detail = (err && err.message) ? err.message : 'Kesalahan tidak diketahui';
+          alert(`Gagal menghapus PO: ${detail}`);
+        } finally {
+          setDeletingPreOrderId(null);
+        }
+      };
+
+      // Hapus SATU entri BAP (Berita Acara Penyesuaian) tertentu. Laporan ini tidak menyimpan
+      // foto, jadi cukup hapus baris DB-nya saja.
+      const handleDeleteSingleBap = async () => {
+        if (!detailStore || !confirmDeleteBap) return;
+        setDeletingBapId(confirmDeleteBap.firebaseKey);
+        try {
+          await restRemove(db.ref(`stores/${detailStore.id}/bapReports/${confirmDeleteBap.firebaseKey}`));
+          setConfirmDeleteBap(null);
+          showAdminToast(`🗑️ BAP tanggal ${confirmDeleteBap.tanggal} berhasil dihapus.`);
+        } catch (err) {
+          console.error('Gagal menghapus BAP:', err);
+          const detail = (err && err.message) ? err.message : 'Kesalahan tidak diketahui';
+          alert(`Gagal menghapus BAP: ${detail}`);
+        } finally {
+          setDeletingBapId(null);
+        }
+      };
+
+
+      // jadi selain hapus baris DB, file di R2 juga ikut dihapus permanen lewat fotoKey supaya
+      // storage tidak menumpuk sampah foto yang sudah tidak ada reference-nya di database.
+      const handleDeleteWasteFoto = async () => {
+        if (!detailStore || !confirmDeleteWasteFoto) return;
+        setDeletingWasteFotoKey(confirmDeleteWasteFoto.firebaseKey);
+        try {
+          await restRemove(db.ref(`stores/${detailStore.id}/wasteFotos/${confirmDeleteWasteFoto.firebaseKey}`));
+          if (confirmDeleteWasteFoto.fotoKey) await deleteMediaFromR2(confirmDeleteWasteFoto.fotoKey);
+          setConfirmDeleteWasteFoto(null);
+          showAdminToast('🗑️ Foto berhasil dihapus permanen.');
+        } catch (err) {
+          console.error('Gagal menghapus foto:', err);
+          const detail = (err && err.message) ? err.message : 'Kesalahan tidak diketahui';
+          alert(`Gagal menghapus foto: ${detail}`);
+        } finally {
+          setDeletingWasteFotoKey(null);
+        }
+      };
+
+      // Ganti token login toko.
+      // CATATAN PERBAIKAN BUG: kode lama mencoba re-autentikasi ke Firebase Auth lewat
+      // `secondaryAuth.signInWithEmailAndPassword(...)` lalu `cred.user.updatePassword(...)`.
+      // Ini SISA kode dari sebelum migrasi ke Cloudflare Worker — `secondaryAuth` sekarang
+      // cuma stub ringan yang CUMA punya `createUserWithEmailAndPassword` & `signOut`
+      // (lihat definisinya di atas), sehingga `signInWithEmailAndPassword` selalu
+      // menghasilkan TypeError ("... is not a function") dan proses reset gagal total
+      // sebelum sempat menyentuh database sama sekali.
+      //
+      // Sejak migrasi, token toko TIDAK lagi disimpan lewat Firebase Auth — token hanya
+      // field data biasa di `stores/{id}/info/token` (persis seperti saat toko baru dibuat
+      // di `handleAddStore`). Jadi reset token cukup: generate token baru lalu update
+      // langsung ke database via Worker, tanpa perlu "login ulang" sama sekali.
+      const handleRegenerateToken = async (store) => {
+        if (!store || !store.id) {
+          console.error('handleRegenerateToken dipanggil tanpa data toko yang valid:', store);
+          setRegeneratedToken('ERROR');
+          return;
+        }
+        setRegeneratingToken(true);
+        setRegeneratedToken(null);
+        try {
+          const newToken = generateSecureToken(16);
+
+          // Update ke Cloudflare Worker (Realtime Database). Kalau request ini gagal
+          // (network/HTTP error), restSet akan melempar error dan ditangkap di catch,
+          // sehingga token LAMA tetap berlaku (tidak ada state "setengah update").
+          await restSet(db.ref(`stores/${store.id}/info/token`), newToken);
+
+          // Baru setelah database dipastikan ter-update, perbarui tampilan di sisi client.
+          setRegeneratedToken(newToken);
+          setDetailStore(prev => (prev && prev.id === store.id) ? { ...prev, token: newToken } : prev);
+          setStores(prev => prev.map(s => s.id === store.id ? { ...s, token: newToken } : s));
+        } catch (err) {
+          console.error('Gagal mereset token toko "' + store.id + '":', err);
+          setRegeneratedToken('ERROR');
+        } finally {
+          setRegeneratingToken(false);
+        }
+      };
+
+      // Set token KUSTOM (dipilih sendiri oleh admin), berbeda dari handleRegenerateToken
+      // yang selalu acak. Validasi minimal di client (panjang & karakter aman) supaya token
+      // custom tidak sengaja jadi terlalu lemah/kosong; TIDAK ada perubahan skema di worker.js
+      // karena field `token` di `stores/{id}/info` memang sudah bebas isi apa saja.
+      const handleSetCustomToken = async (store) => {
+        if (!store || !store.id) {
+          console.error('handleSetCustomToken dipanggil tanpa data toko yang valid:', store);
+          return;
+        }
+        const value = customTokenInput.trim();
+        if (value.length < 6) {
+          setCustomTokenError('Token minimal 6 karakter.');
+          return;
+        }
+        if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+          setCustomTokenError('Hanya boleh huruf, angka, titik, garis bawah, dan strip (tanpa spasi).');
+          return;
+        }
+        setSettingCustomToken(true);
+        setCustomTokenError(null);
+        setRegeneratedToken(null);
+        try {
+          await restSet(db.ref(`stores/${store.id}/info/token`), value);
+          setRegeneratedToken(value);
+          setDetailStore(prev => (prev && prev.id === store.id) ? { ...prev, token: value } : prev);
+          setStores(prev => prev.map(s => s.id === store.id ? { ...s, token: value } : s));
+          setCustomTokenInput('');
+        } catch (err) {
+          console.error('Gagal menyetel token kustom toko "' + store.id + '":', err);
+          setCustomTokenError('Gagal menyimpan token. Coba lagi.');
+        } finally {
+          setSettingCustomToken(false);
+        }
+      };
+
+      const handleDeleteStore = async (store) => {
+        try {
+          const updates = {
+            [`stores/${store.id}`]: null,
+            [`storeDirectory/${store.id}`]: null,
+          };
+          if (store.uid) updates[`storeUidMap/${store.uid}`] = null;
+          await restMultiUpdate(updates);
+          setConfirmDelete(null);
+          setDetailStore(null);
+          setStores(prev => prev.filter(s => s.id !== store.id));
+        } catch (err) {
+          console.error(err);
+          alert('Gagal menghapus toko: ' + (err && err.message ? err.message : 'periksa koneksi internet Anda'));
+        }
+      };
+
+      const totalRevenue = (historyList) => historyList.reduce((sum, h) => sum + (h.revenue || 0), 0);
+
+      const handleToggleActive = async (store) => {
+        try {
+          const newActive = store.active === false ? true : false;
+          await restSet(db.ref(`stores/${store.id}/info/active`), newActive);
+          setStores(prev => prev.map(s => s.id === store.id ? { ...s, active: newActive } : s));
+        } catch (err) {
+          console.error(err);
+        }
+      };
+
+      // Buka chat dengan toko tertentu & langsung tandai terbaca (hilangkan badge unread seketika)
+      const openChatWithStore = (store) => {
+        setTab('chat');
+        setActiveChatStore(store);
+        localStorage.setItem(`tarobun_chat_lastread_admin_${store.id}`, Date.now().toString());
+        setUnreadByStore(prev => {
+          if (!prev[store.id]) return prev;
+          const next = { ...prev };
+          delete next[store.id];
+          return next;
+        });
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-50 text-slate-800">
+          {showOnboarding && (
+            <TourGuide steps={ADMIN_ONBOARDING_STEPS} onFinish={finishAdminOnboarding} onOpenMenu={setShowMenu} />
+          )}
+          {showMandatoryChecklist && (
+            <MandatoryChecklistModal items={MANDATORY_ADMIN_CHECKLIST} onAcknowledge={() => setShowMandatoryChecklist(false)} />
+          )}
+          <header className="bg-gradient-to-r from-indigo-900 to-purple-900 text-white shadow-md sticky top-0 z-20 px-4 py-3">
+            <div className="max-w-5xl mx-auto flex justify-between items-center">
+              <div className="flex items-center gap-2 min-w-0">
+                <button
+                  onClick={() => setShowMenu(true)}
+                  className="p-2 -ml-1 bg-white/10 hover:bg-white/20 rounded-lg text-white border border-white/20 transition-all shrink-0"
+                  title="Menu"
+                >
+                  <i data-lucide="menu" className="w-5 h-5"></i>
+                </button>
+                <div className="bg-white text-indigo-900 w-8 h-8 rounded-full font-bold flex items-center justify-center text-md tracking-wider shrink-0">A</div>
+                <div className="min-w-0">
+                  <h1 className="font-display font-extrabold text-sm md:text-base tracking-wide truncate">Panel Admin TAROBUN</h1>
+                  <p className="text-[10px] text-purple-200 truncate">Kelola seluruh cabang toko</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {notifPermission !== 'granted' && notifPermission !== 'unsupported' && (
+                  <button onClick={handleEnableNotif} className="p-2 bg-amber-500 hover:bg-amber-600 rounded-lg text-white transition-all" title="Aktifkan notifikasi browser">
+                    <i data-lucide="bell" className="w-5 h-5"></i>
+                  </button>
+                )}
+                <button onClick={onLogout} className="p-2 bg-white/10 hover:bg-rose-600 rounded-lg text-white transition-all" title="Keluar">
+                  <i data-lucide="log-out" className="w-5 h-5"></i>
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Sidebar Hamburger Menu */}
+          {showMenu && (
+            <div className="fixed inset-0 z-40 flex">
+              {/* Overlay */}
+              <div className="fixed inset-0 bg-black/50 animate-fadeIn" onClick={() => setShowMenu(false)}></div>
+
+              {/* Panel */}
+              <div className="relative bg-white w-72 max-w-[80%] h-full shadow-xl flex flex-col animate-slideInLeft">
+                <div className="bg-gradient-to-r from-indigo-900 to-purple-900 text-white px-4 py-4 flex items-center justify-between">
+                  <div className="flex items-center space-x-2">
+                    <div className="bg-white text-indigo-900 w-8 h-8 rounded-full font-bold flex items-center justify-center text-md tracking-wider">
+                      A
+                    </div>
+                    <div>
+                      <h2 className="font-display font-extrabold text-sm tracking-wide">Panel Admin</h2>
+                      <p className="text-[10px] text-purple-200">Menu Navigasi</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setShowMenu(false)} className="p-1.5 hover:bg-white/10 rounded-lg">
+                    <i data-lucide="x" className="w-5 h-5"></i>
+                  </button>
+                </div>
+
+                <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-1">
+                  <button data-tour="menu-stores" onClick={() => { setTab('stores'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'stores' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="store" className="w-4 h-4"></i>
+                    <span>Kelola Toko</span>
+                  </button>
+                  <button data-tour="menu-formbuilder" onClick={() => { setTab('formbuilder'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'formbuilder' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="layout-list" className="w-4 h-4"></i>
+                    <span>Form Builder</span>
+                  </button>
+                  <button data-tour="menu-sop" onClick={() => { setTab('sop'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'sop' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="book-open" className="w-4 h-4"></i>
+                    <span>Panduan SOP</span>
+                    <span className="ml-auto text-[10px] bg-indigo-100 text-indigo-700 font-bold px-1.5 py-0.5 rounded-md">{sopCategories.length}</span>
+                  </button>
+                  <button data-tour="menu-chat" onClick={() => { setTab('chat'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'chat' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="message-circle" className="w-4 h-4"></i>
+                    <span>Chat</span>
+                    {totalAdminUnread > 0 && <span className="ml-auto text-[10px] bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded-md">{totalAdminUnread}</span>}
+                  </button>
+                  <button onClick={() => { setTab('webupdate'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'webupdate' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="megaphone" className="w-4 h-4"></i>
+                    <span>Update Web</span>
+                  </button>
+                  <button onClick={() => { setTab('devices'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${tab === 'devices' ? 'bg-indigo-50 text-indigo-900' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="monitor-smartphone" className="w-4 h-4"></i>
+                    <span>Perangkat</span>
+                  </button>
+
+                  <div className="pt-3 mt-3 border-t border-slate-100 space-y-1">
+                    <button onClick={() => { setShowOnboarding(true); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-all">
+                      <i data-lucide="help-circle" className="w-4 h-4"></i>
+                      <span>Lihat Tur Panduan</span>
+                    </button>
+                    <button onClick={onLogout} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-rose-700 hover:bg-rose-50 transition-all">
+                      <i data-lucide="log-out" className="w-4 h-4"></i>
+                      <span>Keluar / Logout</span>
+                    </button>
+                  </div>
+                </nav>
+              </div>
+            </div>
+          )}
+
+          {/* Banner error kalau listener notifikasi chat gagal (mis. Firebase Rules memblokir),
+              supaya admin SADAR notifikasi sedang tidak berfungsi, bukan diam-diam gagal terus. */}
+          {chatListenerError && (
+            <div className="bg-rose-600 text-white text-xs font-semibold px-4 py-2 text-center sticky top-[60px] z-20">
+              ⚠️ {chatListenerError}
+            </div>
+          )}
+
+          {/* Toast notifikasi pesan chat baru dari toko */}
+          {adminToast && (
+            <div className="bg-indigo-900 text-white rounded-lg px-4 py-3 shadow-lg fixed bottom-6 right-4 left-4 md:right-8 md:left-auto md:max-w-md z-50 flex items-center space-x-2">
+              <i data-lucide="message-circle" className="w-5 h-5 text-sky-400 shrink-0"></i>
+              <span className="text-xs font-semibold">{adminToast}</span>
+            </div>
+          )}
+
+          <main className="max-w-5xl w-full mx-auto p-4">
+            {tab === 'stores' && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">Total Cabang</p>
+                    <p className="text-2xl font-extrabold text-slate-800 mt-1">{stores.length}</p>
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">Toko Aktif</p>
+                    <p className="text-2xl font-extrabold text-emerald-600 mt-1">{stores.filter(s => s.active !== false).length}</p>
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">Toko Nonaktif</p>
+                    <p className="text-2xl font-extrabold text-slate-600 mt-1">{stores.filter(s => s.active === false).length}</p>
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <p className="text-[10px] font-bold text-slate-600 uppercase tracking-wide">Chat Belum Dibaca</p>
+                    <p className="text-2xl font-extrabold text-rose-500 mt-1">{totalAdminUnread}</p>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                  <h3 className="font-bold text-slate-700 text-sm mb-3">Monitor Kehadiran Cabang</h3>
+                  <div className="space-y-2">
+                    {stores.map(store => {
+                      const p = storesPresence[store.id];
+                      const isOnline = isStoreOnline(p);
+                      const lastSeenStr = p?.lastSeen
+                        ? new Date(p.lastSeen).toLocaleString('id-ID', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short' })
+                        : 'Belum pernah aktif';
+                      return (
+                        <div key={store.id} className="flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <PresenceDot isOnline={isOnline} />
+                            <span className="text-sm font-semibold text-slate-700 truncate">{store.name}</span>
+                          </div>
+                          <span className="text-[10px] text-slate-600 shrink-0 ml-2">
+                            {isOnline ? 'Sedang dibuka' : `Terakhir aktif: ${lastSeenStr}`}
+                          </span>
+                        </div>
+                      );
+                    })}
+                    {stores.length === 0 && (
+                      <p className="text-xs text-slate-600 text-center py-4">Belum ada toko.</p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex justify-between items-center flex-wrap gap-2">
+                  <h2 className="font-bold text-slate-700 text-base">Daftar Cabang Toko ({stores.length})</h2>
+                  <button onClick={() => { setShowAdd(true); setErrorMsg(''); }} className="bg-purple-800 hover:bg-purple-900 text-white text-xs font-bold px-3 py-2 rounded-lg flex items-center gap-1.5">
+                    <i data-lucide="plus" className="w-3.5 h-3.5"></i> Tambah Toko
+                  </button>
+                </div>
+
+                {errorMsg && <div className="bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold rounded-lg px-3 py-2">{errorMsg}</div>}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {stores.map(store => (
+                    <div key={store.id} className={`bg-white rounded-xl border p-4 shadow-sm ${store.active === false ? 'opacity-50 border-slate-200' : 'border-slate-200'}`}>
+                      <div className="flex items-start justify-between gap-2 mb-2">
+                        <div className="min-w-0">
+                          <h3 className="font-bold text-slate-800 text-sm truncate flex items-center gap-1.5">
+                            <PresenceDot isOnline={isStoreOnline(storesPresence[store.id])} />
+                            <span className="truncate">{store.name}</span>
+                          </h3>
+                          <p className="text-[10px] text-slate-600">Dibuat: {store.createdAt ? new Date(store.createdAt).toLocaleDateString('id-ID') : '-'}</p>
+                          {store.active === false && <span className="inline-block mt-1 text-[9px] font-bold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded">NONAKTIF</span>}
+                        </div>
+                        <i data-lucide="store" className="w-5 h-5 text-purple-600 shrink-0"></i>
+                      </div>
+                      <div className="flex gap-2 mt-3">
+                        <button onClick={() => openDetail(store)} className="flex-1 bg-purple-50 text-purple-700 text-xs font-bold py-1.5 rounded-lg border border-purple-100">Lihat Detail</button>
+                        <button onClick={() => openChatWithStore(store)} className="relative p-1.5 bg-sky-50 text-sky-700 rounded-lg border border-sky-100">
+                          <i data-lucide="message-circle" className="w-3.5 h-3.5"></i>
+                          {unreadByStore[store.id] > 0 && (
+                            <span className="absolute -top-1.5 -right-1.5 bg-rose-500 text-white text-[9px] font-bold w-4 h-4 rounded-full flex items-center justify-center">{unreadByStore[store.id] > 9 ? '9+' : unreadByStore[store.id]}</span>
+                          )}
+                        </button>
+                        <button onClick={() => handleToggleActive(store)} title={store.active === false ? 'Aktifkan' : 'Nonaktifkan'} className="p-1.5 bg-amber-50 text-amber-700 rounded-lg border border-amber-100">
+                          <i data-lucide={store.active === false ? 'play' : 'pause'} className="w-3.5 h-3.5"></i>
+                        </button>
+                        <button onClick={() => setConfirmDelete(store)} className="p-1.5 bg-rose-50 text-rose-700 rounded-lg border border-rose-100"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
+                      </div>
+                    </div>
+                  ))}
+                  {stores.length === 0 && (
+                    <div className="col-span-full text-center py-12 text-slate-600 text-sm">Belum ada toko. Klik "Tambah Toko" untuk membuat cabang pertama.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {tab === 'formbuilder' && (
+              <div className="space-y-4 max-w-3xl">
+                <div>
+                  <h2 className="font-bold text-slate-700 text-base">Form Builder</h2>
+                  <p className="text-xs text-slate-500 mt-1">Tambahkan pertanyaan/field ekstra ke form Laporan Penjualan atau SO Stok toko. Field ini akan langsung muncul di aplikasi semua toko. Field inti (jumlah roti, keuangan, stok bahan baku, dll) tidak bisa dihapus karena dipakai untuk perhitungan otomatis — hanya field tambahan di sini yang bisa diatur bebas.</p>
+                </div>
+
+                <form onSubmit={handleAddFormField} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 space-y-3">
+                  <h3 className="font-bold text-slate-700 text-sm">Tambah Field Baru</h3>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label htmlFor="newFieldTarget" className="block text-[10px] font-semibold text-slate-600 mb-1">Form Tujuan</label>
+                      <select id="newFieldTarget" value={newFieldTarget} onChange={(e) => setNewFieldTarget(e.target.value)} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs bg-white">
+                        <option value="sales">Laporan Penjualan</option>
+                        <option value="inventory">SO Stok / Inventory</option>
+                      </select>
+                      {newFieldTarget === 'sales' && (
+                        <p className="text-[10px] text-slate-600 mt-1">Pilih "SO Stok / Inventory" di atas untuk memunculkan pilihan Bagian penempatan field.</p>
+                      )}
+                    </div>
+                    <div>
+                      <label htmlFor="newFieldType" className="block text-[10px] font-semibold text-slate-600 mb-1">Tipe Input</label>
+                      <select id="newFieldType" value={newFieldType} onChange={(e) => setNewFieldType(e.target.value)} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs bg-white">
+                        <option value="number">Angka</option>
+                        <option value="text">Teks</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label htmlFor="newFieldLabel" className="block text-[10px] font-semibold text-slate-600 mb-1">Nama / Label Field</label>
+                      <input id="newFieldLabel" type="text" value={newFieldLabel} onChange={(e) => setNewFieldLabel(e.target.value)} placeholder="Contoh: Stok Sedotan" className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs" required />
+                    </div>
+                    <div>
+                      <label htmlFor="newFieldUnit" className="block text-[10px] font-semibold text-slate-600 mb-1">Satuan (opsional)</label>
+                      <input id="newFieldUnit" type="text" value={newFieldUnit} onChange={(e) => setNewFieldUnit(e.target.value)} placeholder="Contoh: pcs" className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs" />
+                    </div>
+                    {newFieldTarget === 'inventory' && (
+                      <div className="sm:col-span-2">
+                        <label htmlFor="newFieldSection" className="block text-[10px] font-semibold text-slate-600 mb-1">Bagian (di mana field ini akan muncul)</label>
+                        <select id="newFieldSection" value={newFieldSection} onChange={(e) => setNewFieldSection(e.target.value)} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs bg-white">
+                          {INVENTORY_FORM_SECTIONS.map(s => (
+                            <option key={s.value} value={s.value}>{s.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <div className="sm:col-span-2">
+                      <label className="block text-[10px] font-semibold text-slate-600 mb-1">Berlaku untuk Toko Mana</label>
+                      <StorePicker
+                        stores={stores}
+                        selectedIds={newFieldStoreIds}
+                        onToggle={toggleNewFieldStore}
+                        onSelectAll={() => setNewFieldStoreIds([])}
+                        activeColorClass="bg-purple-800 text-white border-purple-800"
+                      />
+                      <p className="text-[10px] text-slate-600">Klik "Semua Toko" agar berlaku untuk semua, atau pilih satu/beberapa toko tertentu saja. Field ini juga akan otomatis ikut muncul di laporan Telegram sesuai toko yang dipilih.</p>
+                    </div>
+                  </div>
+                  <button type="submit" disabled={savingField} className="bg-purple-800 disabled:opacity-50 text-white text-xs font-bold px-4 py-2 rounded-lg">
+                    {savingField ? 'Menambahkan...' : '+ Tambah Field'}
+                  </button>
+                </form>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <h3 className="font-bold text-slate-700 text-sm mb-3">Field Tambahan — Laporan Penjualan</h3>
+                    {formSchemas.sales.length === 0 ? (
+                      <p className="text-xs text-slate-600">Belum ada field tambahan.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {formSchemas.sales.map(f => (
+                          <div key={f.id} className="flex items-center justify-between bg-slate-50 rounded-lg px-3 py-2">
+                            <div className="min-w-0">
+                              <span className="text-xs font-semibold text-slate-700 block truncate">{f.label}{f.unit ? ` (${f.unit})` : ''}</span>
+                              <span className="text-[10px] text-purple-600 font-semibold">{getFieldStoreLabel(f)}</span>
+                            </div>
+                            <button onClick={() => handleDeleteFormField('sales', f.id)} className="text-rose-500 shrink-0"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                    <h3 className="font-bold text-slate-700 text-sm mb-3">Field Tambahan — SO Stok</h3>
+                    {formSchemas.inventory.length === 0 ? (
+                      <p className="text-xs text-slate-600">Belum ada field tambahan.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {formSchemas.inventory.map(f => (
+                          <div key={f.id} className="flex items-center justify-between bg-slate-50 rounded-lg px-3 py-2">
+                            <div className="min-w-0">
+                              <span className="text-xs font-semibold text-slate-700 block truncate">{f.label}{f.unit ? ` (${f.unit})` : ''}</span>
+                              <span className="text-[10px] text-indigo-600 font-semibold block">{getInventorySectionLabel(f.section)}</span>
+                              <span className="text-[10px] text-purple-600 font-semibold">{getFieldStoreLabel(f)}</span>
+                            </div>
+                            <button onClick={() => handleDeleteFormField('inventory', f.id)} className="text-rose-500 shrink-0"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {tab === 'sop' && (
+              <div className="space-y-4 max-w-3xl">
+                <div>
+                  <h2 className="font-bold text-slate-700 text-base">Panduan SOP</h2>
+                  <p className="text-xs text-slate-500 mt-1">Kelola Kategori SOP beserta isi teks dan foto/video pendukung. Pilih toko mana saja yang boleh melihat setiap kategori — kosongkan pilihan toko untuk membuatnya berlaku di semua toko.</p>
+                </div>
+
+                {/* Tambah Kategori Baru */}
+                <form onSubmit={handleAddSopCategory} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 space-y-3">
+                  <h3 className="font-bold text-slate-700 text-sm">Tambah Kategori SOP</h3>
+                  <div>
+                    <label htmlFor="newSopName" className="block text-[10px] font-semibold text-slate-600 mb-1">Nama Kategori</label>
+                    <input id="newSopName" type="text" value={newSopName} onChange={(e) => setNewSopName(e.target.value)} placeholder="Contoh: SOP Kebersihan Dapur" className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs" required />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-600 mb-1">Isi Teks SOP</label>
+                    <textarea value={newSopContent} onChange={(e) => setNewSopContent(e.target.value)} placeholder="Tuliskan langkah-langkah SOP di sini..." rows={4} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"></textarea>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-600 mb-1">Berlaku untuk Toko Mana</label>
+                    <StorePicker
+                      stores={stores}
+                      selectedIds={newSopStoreIds}
+                      onToggle={toggleNewSopStore}
+                      onSelectAll={() => setNewSopStoreIds([])}
+                      activeColorClass="bg-indigo-900 text-white border-indigo-900"
+                    />
+                    <p className="text-[10px] text-slate-600">Klik "Semua Toko" agar SOP ini muncul di semua cabang, atau pilih satu/beberapa toko tertentu saja.</p>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-600 mb-1">Foto/Video Pendukung (opsional)</label>
+                    <label className="inline-block text-[10px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer bg-indigo-50 text-indigo-700 hover:bg-indigo-100">
+                      + Pilih Foto/Video
+                      <input
+                        type="file"
+                        accept="image/*,video/*"
+                        multiple
+                        onChange={(e) => { setNewSopFiles(prev => [...prev, ...Array.from(e.target.files || [])]); e.target.value = ''; }}
+                        className="hidden"
+                      />
+                    </label>
+                    {newSopFiles.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 mt-2">
+                        {newSopFiles.map((f, idx) => (
+                          <span key={idx} className="flex items-center gap-1 bg-slate-100 text-slate-600 text-[10px] font-semibold px-2 py-1 rounded-md">
+                            {f.type.startsWith('video/') ? '🎥' : '🖼️'} {f.name}
+                            <button type="button" onClick={() => setNewSopFiles(prev => prev.filter((_, i) => i !== idx))} className="text-slate-600 hover:text-rose-600 ml-0.5">
+                              <i data-lucide="x" className="w-3 h-3"></i>
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <button type="submit" disabled={savingSop} className="bg-indigo-900 disabled:opacity-50 text-white text-xs font-bold px-4 py-2 rounded-lg">
+                    {savingSop ? 'Menambahkan...' : '+ Tambah Kategori'}
+                  </button>
+                </form>
+
+                {/* Daftar Kategori SOP */}
+                <div className="space-y-3">
+                  {sopCategories.length === 0 ? (
+                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-8 text-center text-slate-600 text-sm">Belum ada kategori SOP. Tambahkan kategori pertama di atas.</div>
+                  ) : sopCategories.map(cat => (
+                    <div key={cat.id} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                      {editingSopId === cat.id ? (
+                        <div className="space-y-3">
+                          <div>
+                            <label htmlFor="editSopDraft_name" className="block text-[10px] font-semibold text-slate-600 mb-1">Nama Kategori</label>
+                            <input id="editSopDraft_name" type="text" value={editSopDraft.name} onChange={(e) => setEditSopDraft(prev => ({ ...prev, name: e.target.value }))} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs" />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] font-semibold text-slate-600 mb-1">Isi Teks SOP</label>
+                            <textarea value={editSopDraft.content} onChange={(e) => setEditSopDraft(prev => ({ ...prev, content: e.target.value }))} rows={4} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs"></textarea>
+                          </div>
+                          <div>
+                            <label className="block text-[10px] font-semibold text-slate-600 mb-1">Berlaku untuk Toko Mana</label>
+                            <StorePicker
+                              stores={stores}
+                              selectedIds={editSopDraft.storeIds}
+                              onToggle={toggleEditSopStore}
+                              onSelectAll={() => setEditSopDraft(prev => ({ ...prev, storeIds: [] }))}
+                              activeColorClass="bg-indigo-900 text-white border-indigo-900"
+                            />
+                          </div>
+                          <div className="flex gap-2">
+                            <button onClick={() => handleSaveEditSop(cat.id)} disabled={savingSop} className="bg-indigo-900 disabled:opacity-50 text-white text-xs font-bold px-4 py-2 rounded-lg">Simpan</button>
+                            <button onClick={cancelEditSop} className="bg-slate-100 text-slate-600 text-xs font-bold px-4 py-2 rounded-lg">Batal</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div>
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <h3 className="font-bold text-slate-800 text-sm truncate">{cat.name}</h3>
+                              <p className="text-[10px] text-indigo-600 font-semibold mt-0.5">{getSopStoreLabel(cat)}</p>
+                            </div>
+                            <div className="flex gap-1.5 shrink-0">
+                              <button onClick={() => startEditSop(cat)} className="p-1.5 text-slate-500 hover:bg-slate-100 rounded-lg" title="Edit"><i data-lucide="pencil" className="w-3.5 h-3.5"></i></button>
+                              <button onClick={() => setConfirmDeleteSop(cat)} className="p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg" title="Hapus"><i data-lucide="trash-2" className="w-3.5 h-3.5"></i></button>
+                            </div>
+                          </div>
+                          {cat.content && <p className="text-xs text-slate-600 mt-2 whitespace-pre-wrap">{cat.content}</p>}
+                        </div>
+                      )}
+
+                      {/* Media Foto/Video */}
+                      <div className="mt-3 pt-3 border-t border-slate-100">
+                        <div className="flex items-center justify-between mb-2">
+                          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wide">Foto/Video Pendukung ({cat.media.length})</p>
+                          <label className={`text-[10px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer ${uploadingSopMedia === cat.id ? 'bg-slate-100 text-slate-600' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'}`}>
+                            {uploadingSopMedia === cat.id ? 'Mengupload...' : '+ Tambah File'}
+                            <input type="file" accept="image/*,video/*" multiple disabled={uploadingSopMedia === cat.id} onChange={(e) => { handleUploadSopMedia(cat.id, e.target.files); e.target.value = ''; }} className="hidden" />
+                          </label>
+                        </div>
+                        {cat.media.length > 0 && (
+                          <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                            {cat.media.map(m => (
+                              <div key={m.id} className="relative group aspect-square bg-slate-100 rounded-lg overflow-hidden">
+                                {m.type === 'image' ? (
+                                  <img src={m.url} alt={m.originalName || m.name} className="w-full h-full object-cover" />
+                                ) : (
+                                  <video src={m.url} className="w-full h-full object-cover" muted></video>
+                                )}
+                                {m.type === 'video' && (
+                                  <div className="absolute inset-0 flex items-center justify-center bg-black/20">
+                                    <i data-lucide="play-circle" className="w-6 h-6 text-white"></i>
+                                  </div>
+                                )}
+                                <button onClick={() => handleDeleteSopMedia(cat.id, m)} className="absolute top-1 right-1 bg-black/60 hover:bg-rose-600 text-white rounded-full p-1" title="Hapus file">
+                                  <i data-lucide="x" className="w-3 h-3"></i>
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {tab === 'chat' && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3 md:col-span-1 max-h-[70vh] overflow-y-auto">
+                  <h3 className="font-bold text-slate-700 text-sm px-2 pb-2 border-b border-slate-100 mb-2">Pilih Toko</h3>
+                  {stores.length > 5 && (
+                    <div className="relative mb-2">
+                      <i data-lucide="search" className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"></i>
+                      <input
+                        type="text"
+                        value={chatStoreQuery}
+                        onChange={(e) => setChatStoreQuery(e.target.value)}
+                        placeholder="Cari nama toko..."
+                        className="w-full pl-8 pr-2.5 py-1.5 border border-slate-300 rounded-lg text-[11px]"
+                      />
+                    </div>
+                  )}
+                  {stores.filter(store => !chatStoreQuery.trim() || store.name.toLowerCase().includes(chatStoreQuery.trim().toLowerCase())).map(store => (
+                    <button key={store.id} onClick={() => openChatWithStore(store)} className={`w-full flex items-center justify-between text-left px-3 py-2 rounded-lg text-sm font-semibold mb-1 ${activeChatStore?.id === store.id ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        <PresenceDot isOnline={isStoreOnline(storesPresence[store.id])} size="w-2 h-2" />
+                        <span className="truncate">{store.name}</span>
+                      </span>
+                      {unreadByStore[store.id] > 0 && (
+                        <span className="ml-2 shrink-0 bg-rose-100 text-rose-700 text-[10px] font-bold px-1.5 py-0.5 rounded-md">{unreadByStore[store.id]}</span>
+                      )}
+                    </button>
+                  ))}
+                  {chatStoreQuery.trim() && stores.filter(store => store.name.toLowerCase().includes(chatStoreQuery.trim().toLowerCase())).length === 0 && (
+                    <p className="text-[11px] text-slate-400 px-2 py-2">Tidak ada toko yang cocok dengan "{chatStoreQuery}".</p>
+                  )}
+                </div>
+                <div className="md:col-span-2">
+                  {activeChatStore ? (
+                    <ChatPanel storeId={activeChatStore.id} senderRole="admin" senderLabel="Admin" title={`Chat dengan ${activeChatStore.name}`} allowEndSession={true} />
+                  ) : (
+                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-10 text-center text-slate-600 text-sm">Pilih toko di sebelah kiri untuk mulai chat.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {tab === 'webupdate' && (
+              <div className="max-w-xl mx-auto space-y-4">
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
+                  <div>
+                    <h3 className="font-bold text-slate-800 text-sm flex items-center gap-1.5"><i data-lucide="megaphone" className="w-4 h-4 text-purple-700"></i> Broadcast Update Web</h3>
+                    <p className="text-[10px] text-slate-500 mt-1">Kirim informasi pembaruan sistem web langsung ke grup/channel Telegram toko lewat Bot Telegram masing-masing toko.</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">Isi Pesan Update</label>
+                    <textarea
+                      value={webUpdateText}
+                      onChange={(e) => setWebUpdateText(e.target.value)}
+                      rows={5}
+                      maxLength={1500}
+                      placeholder="Contoh: Sistem web sudah diperbarui, form Kedatangan Barang kini bisa diisi lewat HP tanpa lag..."
+                      className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm"
+                    ></textarea>
+                    <p className="text-[10px] text-slate-600 text-right mt-1">{webUpdateText.length}/1500</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-2">Store Tujuan</label>
+                    <div className="flex flex-wrap gap-2 mb-2">
+                      <button type="button" onClick={() => { setWebUpdateAll(true); setWebUpdateStoreIds([]); }} className={`px-3 py-1.5 rounded-full text-xs font-bold border ${webUpdateAll ? 'bg-purple-800 text-white border-purple-800' : 'bg-white text-slate-600 border-slate-300'}`}>
+                        Semua Toko
+                      </button>
+                      <button type="button" onClick={() => setWebUpdateAll(false)} className={`px-3 py-1.5 rounded-full text-xs font-bold border ${!webUpdateAll ? 'bg-purple-800 text-white border-purple-800' : 'bg-white text-slate-600 border-slate-300'}`}>
+                        Pilih Toko Tertentu
+                      </button>
+                    </div>
+                    {!webUpdateAll && (
+                      <StorePicker
+                        stores={stores}
+                        selectedIds={webUpdateStoreIds}
+                        onToggle={toggleWebUpdateStore}
+                        mode="checkbox"
+                        maxHeight="max-h-48"
+                      />
+                    )}
+                  </div>
+
+                  <button
+                    onClick={handleSendWebUpdate}
+                    disabled={sendingWebUpdate || !webUpdateText.trim()}
+                    className="w-full flex items-center justify-center gap-2 bg-purple-800 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm"
+                  >
+                    <i data-lucide="send" className="w-4 h-4"></i>
+                    {sendingWebUpdate ? 'Mengirim...' : 'Kirim'}
+                  </button>
+
+                  {webUpdateReport && (
+                    <div className="text-xs space-y-1 pt-1">
+                      {webUpdateReport.success.length > 0 && (
+                        <p className="text-emerald-600 font-semibold">✓ Terkirim: {webUpdateReport.success.join(', ')}</p>
+                      )}
+                      {webUpdateReport.failed.length > 0 && (
+                        <p className="text-rose-600 font-semibold">✗ Gagal: {webUpdateReport.failed.join(', ')}</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {tab === 'devices' && (
+              <div className="max-w-3xl mx-auto space-y-4">
+                <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-1">
+                  <h3 className="font-bold text-slate-800 text-sm flex items-center gap-1.5">
+                    <i data-lucide="monitor-smartphone" className="w-4 h-4 text-purple-700"></i> Monitor Perangkat Login
+                  </h3>
+                  <p className="text-[10px] text-slate-500">
+                    Pantau semua perangkat yang sedang login di tiap toko. Tidak ada lagi batas jumlah device per toko —
+                    satu toko boleh login di berapa pun perangkat sekaligus. Perangkat hanya otomatis keluar kalau tidak
+                    aktif (tidak membuka web) lebih dari 5 jam. Kalau ada perangkat yang tidak Anda kenali, logout paksa lewat tombol di bawah.
+                  </p>
+                </div>
+
+                {loadingDevices && Object.keys(devicesData).length === 0 && (
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-8 text-center text-slate-500 text-xs">
+                    <i data-lucide="loader" className="w-5 h-5 animate-spin mx-auto mb-2"></i> Memuat data perangkat...
+                  </div>
+                )}
+
+                {stores.map(store => {
+                  const list = devicesData[store.id] || [];
+                  return (
+                    <div key={store.id} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                      <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-100">
+                        <div className="flex items-center gap-2">
+                          <PresenceDot isOnline={isStoreOnline(storesPresence[store.id])} size="w-2 h-2" />
+                          <span className="font-bold text-sm text-slate-700">{store.name}</span>
+                        </div>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">
+                          {list.length} perangkat login
+                        </span>
+                      </div>
+                      {list.length === 0 ? (
+                        <p className="text-xs text-slate-500 py-2">Belum ada perangkat yang tercatat login.</p>
+                      ) : (
+                        <div className="space-y-2">
+                          {list.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0)).map(d => {
+                            const kickKey = `${store.id}::${d.deviceId}`;
+                            return (
+                              <div key={d.deviceId} className="flex items-center justify-between gap-2 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2.5">
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5">
+                                    <i data-lucide="smartphone" className="w-3.5 h-3.5 text-slate-500 shrink-0"></i>
+                                    <span className="text-xs font-bold text-slate-700 truncate">{d.deviceLabel || 'Perangkat tidak dikenal'}</span>
+                                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0 ${d.isActive ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-200 text-slate-500'}`}>
+                                      {d.isActive ? 'Aktif' : 'Tidak Aktif'}
+                                    </span>
+                                  </div>
+                                  <p className="text-[10px] text-slate-500 mt-0.5">
+                                    Login: {new Date(d.loginAt).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                                    {' · '}Terakhir aktif: {new Date(d.lastSeen).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                                  </p>
+                                  <p className="text-[9px] text-slate-400 font-mono truncate">ID: {d.deviceId}</p>
+                                </div>
+                                <button
+                                  onClick={() => handleKickDevice(store.id, d.deviceId, d.deviceLabel)}
+                                  disabled={kickingDevice === kickKey}
+                                  className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 disabled:opacity-50 border border-rose-100 px-2.5 py-1.5 rounded-lg"
+                                >
+                                  <i data-lucide={kickingDevice === kickKey ? 'loader' : 'log-out'} className={`w-3 h-3 ${kickingDevice === kickKey ? 'animate-spin' : ''}`}></i>
+                                  Logout Paksa
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {stores.length === 0 && (
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-8 text-center text-slate-500 text-xs">Belum ada toko.</div>
+                )}
+              </div>
+            )}
+          </main>
+
+          {/* Modal Tambah Toko */}
+          {showAdd && (
+            <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-4">Tambah Cabang Toko</h3>
+                <form onSubmit={handleAddStore} className="space-y-4">
+                  <div>
+                    <label htmlFor="newStoreName" className="block text-xs font-semibold text-slate-600 mb-1">Nama Toko</label>
+                    <input id="newStoreName" type="text" value={newStoreName} onChange={(e) => setNewStoreName(e.target.value)} placeholder="Contoh: Tarobun Cabang Kelapa Gading" className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required />
+                  </div>
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => setShowAdd(false)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                    <button type="submit" disabled={creating} className="flex-1 bg-purple-800 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm">{creating ? 'Membuat...' : 'Buat Toko'}</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Token Baru (tampil sekali) */}
+          {createdToken && (
+            <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <div className="flex items-center gap-2 mb-3 text-emerald-600">
+                  <i data-lucide="check-circle" className="w-5 h-5"></i>
+                  <h3 className="font-bold text-slate-800">Toko "{createdToken.name}" Dibuat!</h3>
+                </div>
+                <p className="text-xs text-slate-500 mb-3">Salin token ini dan berikan ke toko. Token <b>hanya ditampilkan sekali</b> dan tidak bisa dilihat lagi setelah ini.</p>
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 font-mono text-sm text-center font-bold text-purple-800 select-all mb-4">
+                  {createdToken.token}
+                </div>
+                <button
+                  onClick={() => { navigator.clipboard?.writeText(createdToken.token); }}
+                  className="w-full bg-purple-50 text-purple-700 border border-purple-100 font-bold py-2.5 rounded-xl text-sm mb-2"
+                >
+                  Salin Token
+                </button>
+                <button onClick={() => setCreatedToken(null)} className="w-full bg-purple-800 text-white font-bold py-2.5 rounded-xl text-sm">Selesai</button>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus */}
+          {confirmDelete && (
+            <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Hapus Toko?</h3>
+                <p className="text-xs text-slate-500 mb-4">Semua data toko "{confirmDelete.name}" (riwayat, stok, foto, chat) akan dihapus permanen dan akses login toko ini langsung dicabut. Tindakan ini tidak bisa dibatalkan.</p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmDelete(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={() => handleDeleteStore(confirmDelete)} className="flex-1 bg-rose-600 text-white font-bold py-2.5 rounded-xl text-sm">Ya, Hapus</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus Kategori SOP */}
+          {confirmDeleteSop && (
+            <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Hapus Kategori SOP?</h3>
+                <p className="text-xs text-slate-500 mb-4">Kategori "{confirmDeleteSop.name}" beserta seluruh foto/video di dalamnya akan dihapus permanen dan tidak akan muncul lagi di aplikasi toko. Tindakan ini tidak bisa dibatalkan.</p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmDeleteSop(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={() => handleDeleteSopCategory(confirmDeleteSop)} className="flex-1 bg-rose-600 text-white font-bold py-2.5 rounded-xl text-sm">Ya, Hapus</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus Laporan >=7 Hari */}
+          {confirmDeleteOldReports && detailStore && detailData && (
+            <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Hapus Laporan Lama?</h3>
+                <p className="text-xs text-slate-500 mb-4">
+                  {getOldReportEntries(detailData.historyList).length} laporan penjualan & stok toko "{detailStore.name}" yang usianya sudah <b>7 hari atau lebih</b> akan dihapus permanen. Toko "{detailStore.name}" akan otomatis mendapat notifikasi lewat Chat bahwa laporan lamanya telah dibersihkan. Tindakan ini tidak bisa dibatalkan.
+                </p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmDeleteOldReports(false)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={handleDeleteOldReports} disabled={deletingOldReports} className="flex-1 bg-rose-600 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm">{deletingOldReports ? 'Menghapus...' : 'Ya, Hapus'}</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus 1 Laporan */}
+          {confirmDeleteReport && detailStore && (
+            <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Hapus Laporan Ini?</h3>
+                <p className="text-xs text-slate-500 mb-4">
+                  Laporan penjualan & stok toko "{detailStore.name}" tanggal <b>{confirmDeleteReport.tanggal}</b> akan dihapus permanen. Tindakan ini tidak bisa dibatalkan.
+                </p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmDeleteReport(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={handleDeleteSingleReport} disabled={!!deletingReportId} className="flex-1 bg-rose-600 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm">{deletingReportId ? 'Menghapus...' : 'Ya, Hapus'}</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus 1 PO — FITUR BARU 2026-07-22 */}
+          {confirmDeletePreOrder && detailStore && (
+            <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Hapus PO Ini?</h3>
+                <p className="text-xs text-slate-500 mb-4">
+                  PO toko "{detailStore.name}" atas nama <b>{confirmDeletePreOrder.namaPemesan || '-'}</b> akan dihapus permanen (termasuk foto buktinya). Tindakan ini tidak bisa dibatalkan.
+                </p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmDeletePreOrder(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={handleDeleteSinglePreOrder} disabled={!!deletingPreOrderId} className="flex-1 bg-rose-600 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm">{deletingPreOrderId ? 'Menghapus...' : 'Ya, Hapus'}</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus 1 BAP — FITUR BARU 2026-07-22 */}
+          {confirmDeleteBap && detailStore && (
+            <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Hapus BAP Ini?</h3>
+                <p className="text-xs text-slate-500 mb-4">
+                  BAP toko "{detailStore.name}" tanggal <b>{confirmDeleteBap.tanggal}</b> akan dihapus permanen. Tindakan ini tidak bisa dibatalkan.
+                </p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmDeleteBap(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={handleDeleteSingleBap} disabled={!!deletingBapId} className="flex-1 bg-rose-600 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm">{deletingBapId ? 'Menghapus...' : 'Ya, Hapus'}</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Konfirmasi Hapus 1 Foto Rijek/Waste */}
+          {confirmDeleteWasteFoto && detailStore && (
+            <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Hapus Foto Ini?</h3>
+                <p className="text-xs text-slate-500 mb-4">
+                  Foto {ADMIN_WASTE_LABELS[confirmDeleteWasteFoto.kategori] || 'Rijek/Waste'} toko "{detailStore.name}" akan dihapus permanen dari database maupun storage. Tindakan ini tidak bisa dibatalkan.
+                </p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmDeleteWasteFoto(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={handleDeleteWasteFoto} disabled={!!deletingWasteFotoKey} className="flex-1 bg-rose-600 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm">{deletingWasteFotoKey ? 'Menghapus...' : 'Ya, Hapus'}</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal Detail Toko */}
+          {detailStore && (
+            <div className="fixed inset-0 z-[90] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-2xl max-h-[85vh] overflow-y-auto p-6">
+                <div className="flex justify-between items-center mb-4 pb-3 border-b border-slate-100">
+                  <h3 className="font-bold text-slate-800 text-lg flex items-center gap-2">
+                    <PresenceDot isOnline={isStoreOnline(storesPresence[detailStore.id])} size="w-3 h-3" />
+                    <span>{detailStore.name}</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isStoreOnline(storesPresence[detailStore.id]) ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                      {isStoreOnline(storesPresence[detailStore.id]) ? 'Sedang dibuka' : 'Offline'}
+                    </span>
+                  </h3>
+                  <button onClick={() => setDetailStore(null)} className="text-slate-600 hover:text-slate-600"><i data-lucide="x" className="w-5 h-5"></i></button>
+                </div>
+                {detailLoading ? (
+                  <StoreDetailSkeleton />
+                ) : detailData ? (
+                  <div className="space-y-6">
+                    <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-3">
+                      <h4 className="font-bold text-slate-700 text-sm flex items-center gap-1.5"><i data-lucide="key-round" className="w-3.5 h-3.5"></i> Kredensial Login Toko</h4>
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 bg-white border border-slate-200 rounded-lg px-3 py-2 font-mono text-sm select-all">
+                          {detailStore.token ? (showToken ? detailStore.token : '•'.repeat(Math.min(detailStore.token.length, 16))) : '(tidak tersedia — dibuat sebelum fitur ini ada, gunakan Reset Token)'}
+                        </div>
+                        {detailStore.token && (
+                          <button onClick={() => setShowToken(v => !v)} className="shrink-0 p-2 bg-white border border-slate-200 rounded-lg text-slate-500"><i data-lucide={showToken ? 'eye-off' : 'eye'} className="w-4 h-4"></i></button>
+                        )}
+                        {detailStore.token && (
+                          <button onClick={() => navigator.clipboard?.writeText(detailStore.token)} className="shrink-0 p-2 bg-white border border-slate-200 rounded-lg text-slate-500"><i data-lucide="copy" className="w-4 h-4"></i></button>
+                        )}
+                      </div>
+                      <button onClick={() => handleRegenerateToken(detailStore)} disabled={regeneratingToken || settingCustomToken} className="w-full bg-slate-800 disabled:opacity-50 text-white text-xs font-bold py-2 rounded-lg">
+                        {regeneratingToken ? 'Mengganti Token...' : 'Reset / Ganti Token Toko (Acak)'}
+                      </button>
+                      {regeneratedToken === 'ERROR' && <p className="text-[10px] text-rose-600 font-semibold">Gagal mengganti token. Coba lagi.</p>}
+                      {regeneratedToken && regeneratedToken !== 'ERROR' && <p className="text-[10px] text-emerald-600 font-semibold">Token baru berhasil dibuat & tersimpan di atas. Beritahu toko token barunya.</p>}
+
+                      {/* TAMBAHAN: admin bisa set token pilihan sendiri (bukan acak). Token AWAL
+                          saat toko baru dibuat tetap acak (lihat handleAddStore) — ini cuma opsi
+                          ganti belakangan, terpisah dari tombol acak di atas. */}
+                      <div className="pt-2 border-t border-slate-200 space-y-1.5">
+                        <label htmlFor="customTokenInput" className="block text-[10px] font-semibold text-slate-600">Atau set token kustom (pilihan sendiri)</label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            id="customTokenInput"
+                            type="text"
+                            value={customTokenInput}
+                            onChange={(e) => { setCustomTokenInput(e.target.value); setCustomTokenError(null); }}
+                            placeholder="mis. toko-jaya-01"
+                            className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono"
+                            autoComplete="off"
+                          />
+                          <button
+                            onClick={() => handleSetCustomToken(detailStore)}
+                            disabled={settingCustomToken || regeneratingToken || !customTokenInput.trim()}
+                            className="shrink-0 bg-purple-800 disabled:opacity-50 text-white text-xs font-bold py-2 px-3 rounded-lg"
+                          >
+                            {settingCustomToken ? 'Menyimpan...' : 'Simpan'}
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-slate-400">Minimal 6 karakter. Huruf, angka, titik ( . ), underscore ( _ ), dan strip ( - ) saja, tanpa spasi.</p>
+                        {customTokenError && <p className="text-[10px] text-rose-600 font-semibold">{customTokenError}</p>}
+                      </div>
+                    </div>
+
+                    <div className="bg-sky-50 border border-sky-200 rounded-xl p-4 space-y-3">
+                      <h4 className="font-bold text-slate-700 text-sm flex items-center gap-1.5"><i data-lucide="send" className="w-3.5 h-3.5"></i> Integrasi Bot Telegram</h4>
+                      <p className="text-[10px] text-slate-500">Hanya admin yang dapat mengatur ini. Toko tidak lagi bisa mengubah Bot Token / Chat ID sendiri.</p>
+                      <div>
+                        <label htmlFor="telegramForm_botToken" className="block text-[10px] font-semibold text-slate-600 mb-1">Bot Token</label>
+                        <input id="telegramForm_botToken" type="text" value={telegramForm.botToken} onChange={(e) => setTelegramForm({ ...telegramForm, botToken: e.target.value })} placeholder="123456:ABC-..." className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono" />
+                      </div>
+                      <div>
+                        <label htmlFor="telegramForm_chatId" className="block text-[10px] font-semibold text-slate-600 mb-1">Chat ID</label>
+                        <input id="telegramForm_chatId" type="text" value={telegramForm.chatId} onChange={(e) => setTelegramForm({ ...telegramForm, chatId: e.target.value })} placeholder="-100..." className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-mono" />
+                      </div>
+                      <button onClick={handleSaveTelegramConfig} disabled={savingTelegram} className="w-full bg-sky-700 disabled:opacity-50 text-white text-xs font-bold py-2 rounded-lg">
+                        {savingTelegram ? 'Menyimpan...' : (telegramSaved ? '✓ Tersimpan' : 'Simpan Integrasi Telegram')}
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="bg-purple-50 rounded-xl p-4">
+                        <p className="text-[10px] text-purple-500 font-bold uppercase">Total Laporan</p>
+                        <p className="text-xl font-bold text-purple-800">{detailData.historyList.length}</p>
+                      </div>
+                      <div className="bg-emerald-50 rounded-xl p-4">
+                        <p className="text-[10px] text-emerald-500 font-bold uppercase">Total Value Penjualan</p>
+                        <p className="text-lg font-bold text-emerald-700">Rp {totalRevenue(detailData.historyList).toLocaleString('id-ID')}</p>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <h4 className="font-bold text-slate-700 text-sm">Riwayat Penjualan & Stok</h4>
+                        {getOldReportEntries(detailData.historyList).length > 0 && (
+                          <button onClick={() => setConfirmDeleteOldReports(true)} className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-100 px-2 py-1.5 rounded-lg">
+                            <i data-lucide="trash-2" className="w-3 h-3"></i> Hapus Laporan ≥7 Hari ({getOldReportEntries(detailData.historyList).length})
+                          </button>
+                        )}
+                      </div>
+                      {detailData.historyList.length === 0 ? (
+                        <p className="text-xs text-slate-600">Belum ada laporan.</p>
+                      ) : (
+                        <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto border border-slate-100 rounded-xl">
+                          {detailData.historyList.map((h, i) => (
+                            <details key={i} className="p-3">
+                              <summary className="cursor-pointer text-xs font-bold text-slate-700 flex justify-between items-center gap-2">
+                                <span>{h.tanggal}</span>
+                                <span className="flex items-center gap-2">
+                                  <span>Rp {(h.revenue || 0).toLocaleString('id-ID')} • {h.totalSales || 0} pcs</span>
+                                  <button
+                                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); setConfirmDeleteReport({ id: h.id, tanggal: h.tanggal }); }}
+                                    className="shrink-0 p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg"
+                                    title="Hapus laporan ini"
+                                  >
+                                    <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
+                                  </button>
+                                </span>
+                              </summary>
+                              {h.inventory && (
+                                <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 gap-1 text-[10px] text-slate-500">
+                                  {Object.entries(h.inventory).filter(([k, v]) => k !== 'tanggal' && v !== '' && v !== null && typeof v !== 'object').map(([k, v]) => (
+                                    <div key={k} className="bg-slate-50 rounded px-2 py-1"><span className="font-semibold">{k}:</span> {v}</div>
+                                  ))}
+                                  {/* Field tambahan (Form Builder) tersimpan sebagai objek di dalam "custom" —
+                                      dirender terpisah di sini (sebelumnya objek ini sempat coba dirender langsung
+                                      sebagai teks, yang menyebabkan aplikasi crash / layar putih). */}
+                                  {h.inventory.custom && typeof h.inventory.custom === 'object' && Object.entries(h.inventory.custom)
+                                    .filter(([, v]) => v !== '' && v !== null && v !== undefined && typeof v !== 'object')
+                                    .map(([k, v]) => (
+                                      <div key={'custom-' + k} className="bg-purple-50 rounded px-2 py-1"><span className="font-semibold">{k}:</span> {v}</div>
+                                    ))}
+                                </div>
+                              )}
+                            </details>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <h4 className="font-bold text-slate-700 text-sm mb-2">Foto Rijek / Waste ({detailData.wasteList.length})</h4>
+                      {detailData.wasteList.length === 0 ? (
+                        <p className="text-xs text-slate-600">Belum ada foto.</p>
+                      ) : (
+                        <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                          {detailData.wasteList.slice(0, 12).map((w, i) => (
+                            <div key={i} className="relative group">
+                              <img src={w.foto} className="w-full h-20 object-cover rounded-lg border border-slate-200" />
+                              <button
+                                onClick={() => setConfirmDeleteWasteFoto({ firebaseKey: w.firebaseKey, fotoKey: w.fotoKey, kategori: w.kategori })}
+                                className="absolute top-1 right-1 p-1 bg-white/90 text-rose-600 rounded-lg shadow border border-rose-100 hover:bg-rose-50"
+                                title="Hapus foto ini"
+                              >
+                                <i data-lucide="trash-2" className="w-3 h-3"></i>
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Riwayat PO (Pre Order) — FITUR BARU 2026-07-22 */}
+                    <div>
+                      <h4 className="font-bold text-slate-700 text-sm mb-2">Riwayat PO (Pre Order) ({detailData.preOrderList.length})</h4>
+                      {detailData.preOrderList.length === 0 ? (
+                        <p className="text-xs text-slate-600">Belum ada PO.</p>
+                      ) : (
+                        <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto border border-slate-100 rounded-xl">
+                          {detailData.preOrderList.map((po, i) => (
+                            <details key={i} className="p-3">
+                              <summary className="cursor-pointer text-xs font-bold text-slate-700 flex justify-between items-center gap-2">
+                                <span className="truncate">{po.namaPemesan || '-'} • {po.tanggalPesanan}</span>
+                                <span className="flex items-center gap-2 shrink-0">
+                                  <span className="font-normal text-slate-500">Pickup {po.pickupTanggal} {po.pickupJam}</span>
+                                  <button
+                                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); setConfirmDeletePreOrder({ firebaseKey: po.firebaseKey, buktiKey: po.buktiKey, namaPemesan: po.namaPemesan }); }}
+                                    className="shrink-0 p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg"
+                                    title="Hapus PO ini"
+                                  >
+                                    <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
+                                  </button>
+                                </span>
+                              </summary>
+                              <div className="mt-2 text-[11px] text-slate-500 space-y-1">
+                                <p className="whitespace-pre-wrap">{po.isiPesanan}</p>
+                                <p>Metode pickup: {po.metodePickup === 'ojol' ? 'Ojek Online' : 'Ambil Sendiri'}</p>
+                                {po.bukti && <img src={po.bukti} className="w-20 h-20 object-cover rounded-lg border border-slate-200 mt-1" />}
+                              </div>
+                            </details>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Riwayat BAP (Berita Acara Penyesuaian) — FITUR BARU 2026-07-22 */}
+                    <div>
+                      <h4 className="font-bold text-slate-700 text-sm mb-2">Riwayat BAP ({detailData.bapList.length})</h4>
+                      {detailData.bapList.length === 0 ? (
+                        <p className="text-xs text-slate-600">Belum ada BAP.</p>
+                      ) : (
+                        <div className="divide-y divide-slate-100 max-h-56 overflow-y-auto border border-slate-100 rounded-xl">
+                          {detailData.bapList.map((b, i) => (
+                            <details key={i} className="p-3">
+                              <summary className="cursor-pointer text-xs font-bold text-slate-700 flex justify-between items-center gap-2">
+                                <span>{b.tanggal} • {b.transaksi || '-'}</span>
+                                <span className="flex items-center gap-2 shrink-0">
+                                  <span className="font-normal text-slate-500">Selisih Rp {(b.selisih || 0).toLocaleString('id-ID')}</span>
+                                  <button
+                                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); setConfirmDeleteBap({ firebaseKey: b.firebaseKey, tanggal: b.tanggal }); }}
+                                    className="shrink-0 p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg"
+                                    title="Hapus BAP ini"
+                                  >
+                                    <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
+                                  </button>
+                                </span>
+                              </summary>
+                              <div className="mt-2 grid grid-cols-2 gap-1 text-[10px] text-slate-500">
+                                <div className="bg-slate-50 rounded px-2 py-1">POS: Rp {(b.nominalPos || 0).toLocaleString('id-ID')}</div>
+                                <div className="bg-slate-50 rounded px-2 py-1">Channel: Rp {(b.nominalChannel || 0).toLocaleString('id-ID')}</div>
+                                {b.keterangan && <div className="col-span-2 bg-slate-50 rounded px-2 py-1">{b.keterangan}</div>}
+                              </div>
+                            </details>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-rose-500 text-center py-10">Gagal memuat data.</p>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ==========================================
+    // ROOT APLIKASI: MENANGANI SESI & ROUTING LOGIN
+    // ==========================================
+    function AppRoot() {
+      const [session, setSession] = useState(() => loadSession());
+      const [checking, setChecking] = useState(true);
+      // Splash screen animasi masuk: tampil sebentar di awal, lalu otomatis hilang
+      // (lihat SplashScreen -> onFinish). Hanya ditampilkan sekali per kunjungan tab ini.
+      const [showSplash, setShowSplash] = useState(true);
+
+      useEffect(() => {
+        const unsub = auth.onAuthStateChanged(async (user) => {
+          const s = loadSession();
+          if (!user || !s) {
+            setSession(null);
+            clearSession();
+            setChecking(false);
+            return;
+          }
+          setSession(s);
+          setChecking(false);
+        });
+        return () => unsub();
+      }, []);
+
+      // Minta izin notifikasi browser begitu user (admin/toko) berhasil login,
+      // agar bisa mendapat notifikasi saat ada chat baru walau tab sedang tidak aktif.
+      useEffect(() => {
+        if (session) requestNotificationPermission();
+      }, [session]);
+
+      // Cek kedaluwarsa sesi setiap 30 detik (auto logout setelah 24 jam 30 menit)
+      useEffect(() => {
+        const interval = setInterval(() => {
+          const s = loadSession();
+          if (!s && session) {
+            auth.signOut();
+            setSession(null);
+          }
+        }, 30000);
+        return () => clearInterval(interval);
+      }, [session]);
+
+      const handleLogout = async () => {
+        // Best-effort: langsung tandai toko offline saat logout manual, supaya Admin
+        // tidak perlu menunggu heartbeat kedaluwarsa (~45 detik) untuk lihat perubahannya.
+        // Bukan satu-satunya jaring pengaman — kalau ini gagal (mis. jaringan putus),
+        // status tetap otomatis jadi Offline lewat mekanisme kedaluwarsa heartbeat.
+        if (session && session.role === 'store' && session.storeId) {
+          __apiFetch(`${WORKER_BASE}/api/presence/offline`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ storeId: session.storeId, deviceId: getDeviceId() }),
+          }).catch(() => {});
+        }
+        await auth.signOut();
+        clearSession();
+        setSession(null);
+      };
+
+      // ==========================================
+      // AUTO-LOGOUT KARENA TIDAK ADA AKTIVITAS (45 MENIT)
+      // ==========================================
+      // Ini untuk skenario tab MASIH TERBUKA tapi tidak disentuh sama sekali selama 45 menit.
+      // Untuk skenario tab DITUTUP TOTAL selama >5 jam, deteksinya tetap lewat server (lihat
+      // forceKickedLogout di StoreApp — reason 'inactive-timeout' berdasarkan heartbeat
+      // terakhir yang tersimpan di server), jadi kedua aturan ini berjalan berdampingan.
+      useEffect(() => {
+        if (!session) return;
+        const TIMEOUT_MS = 45 * 60 * 1000;
+        let timer = null;
+
+        const doInactivityLogout = async () => {
+          try {
+            if (session.role === 'store' && session.storeId) {
+              await __apiFetch(`${WORKER_BASE}/api/presence/offline`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+                body: JSON.stringify({ storeId: session.storeId, deviceId: getDeviceId() }),
+              }).catch(() => {});
+            }
+          } finally {
+            await auth.signOut();
+            clearSession();
+            setSession(null);
+          }
+        };
+
+        const resetTimer = () => {
+          clearTimeout(timer);
+          timer = setTimeout(doInactivityLogout, TIMEOUT_MS);
+        };
+
+        const activityEvents = ['click', 'scroll', 'keydown', 'touchstart', 'mousemove'];
+        activityEvents.forEach(evt => window.addEventListener(evt, resetTimer, { passive: true }));
+        resetTimer();
+
+        return () => {
+          clearTimeout(timer);
+          activityEvents.forEach(evt => window.removeEventListener(evt, resetTimer));
+        };
+      }, [session]);
+
+      if (showSplash) {
+        return <SplashScreen onFinish={() => setShowSplash(false)} />;
+      }
+
+      if (checking) {
+        return (
+          <div className="min-h-screen flex items-center justify-center bg-slate-50">
+            <i data-lucide="loader" className="w-8 h-8 text-purple-700 animate-spin"></i>
+          </div>
+        );
+      }
+
+      if (!session) {
+        return <LoginScreen onLoggedIn={(s) => setSession(loadSession() || s)} />;
+      }
+
+      if (session.role === 'admin') {
+        return <AdminPanel onLogout={handleLogout} />;
+      }
+
+      return <StoreApp storeId={session.storeId} storeName={session.storeName} onLogout={handleLogout} />;
+    }
+
+    function StoreApp({ storeId, storeName, onLogout }) {
+      // Semua data toko ini disimpan terpisah di bawah node stores/{storeId}/...
+      // sehingga setiap cabang store memiliki data sendiri-sendiri, terisolasi oleh Firebase Security Rules.
+      const storeBase = `stores/${storeId}`;
+      // BUGFIX (2026-07-22): fungsi ini dipakai di 4 tempat (laporan penjualan, stok,
+      // kedatangan barang, BAP) untuk meng-escape karakter spesial Telegram Markdown
+      // (_ * ` [ ) supaya tidak merusak format pesan yang dikirim ke bot. Sebelumnya
+      // fungsi ini TIDAK PERNAH didefinisikan di file ini sama sekali -> ReferenceError
+      // "escapeTelegramMarkdown is not defined" -> seluruh StoreApp crash (layar putih)
+      // begitu komponen ini dirender. Pola escape-nya sama seperti escapeMdWebUpdate
+      // yang dipakai di AdminApp.
+      const escapeTelegramMarkdown = (text) => String(text === null || text === undefined ? '' : text).replace(/([_*`\[])/g, '\\$1');
+  const [activeTab, setActiveTab] = useState('dashboard');
+      const [notification, setNotification] = useState(null);
+      const [showConfig, setShowConfig] = useState(false);
+      // isFirstTime: true kalau flag 'tarobun_onboarding_store_<id>' belum ada di localStorage
+      // perangkat ini (login pertama kali / device baru) -> tur onboarding otomatis jalan.
+      const [showOnboarding, setShowOnboarding] = useState(() => !localStorage.getItem(`tarobun_onboarding_store_${storeId}`));
+      const [showMandatoryChecklist, setShowMandatoryChecklist] = useState(false);
+
+      // Sama seperti admin: cek juga penanda di Firebase agar onboarding tidak muncul lagi
+      // kalau toko login dari HP/browser lain setelah pernah login sebelumnya.
+      useEffect(() => {
+        restOnce(db.ref(`${storeBase}/info/onboardingSeen`)).then(snap => {
+          if (snap.val() === true) {
+            localStorage.setItem(`tarobun_onboarding_store_${storeId}`, '1');
+            setShowOnboarding(false);
+          }
+        }).catch(() => {});
+      }, []);
+
+      const finishStoreOnboarding = () => {
+        localStorage.setItem(`tarobun_onboarding_store_${storeId}`, '1');
+        restSet(db.ref(`${storeBase}/info/onboardingSeen`), true).catch(() => {});
+        setShowOnboarding(false);
+        setShowMenu(false);
+        setShowMandatoryChecklist(true);
+      };
+      const [unreadChat, setUnreadChat] = useState(0);
+
+      // ==========================================
+      // FITUR PRINTING: Label Premix & Catatan Stok
+      // ==========================================
+      // Dua sub-fitur cetak (thermal-friendly, lihat CSS #thermalPrintArea di <style> global):
+      // 1) Premix: label per-item (Nama Toko, Nama Barang, Tanggal Buat, Tanggal Exp, Asal Bahan Produksi).
+      // 2) Catatan Stok: daftar item (FD/Toping) + jumlah + satuan (Bag/Pcs), bisa tambah berkali-kali lalu dicetak sekaligus.
+      const PRINTING_ITEM_OPTIONS = ['FD', 'Toping Taro', 'Coklat', 'Vanila', 'Peach', 'Rasberi', 'Lemon', 'Nanas'];
+      const [printingSubTab, setPrintingSubTab] = useState('premix');
+
+      const [premixForm, setPremixForm] = useState({ namaToko: storeName || '', namaBarang: '', tanggalBuat: '', tanggalExp: '', asalBahan: '' });
+      const [premixPrintData, setPremixPrintData] = useState(null);
+
+      const [stockNoteStore, setStockNoteStore] = useState(storeName || '');
+      const [stockNoteItems, setStockNoteItems] = useState([]); // [{ id, nama, jumlah, satuan }]
+      const [stockItemDraft, setStockItemDraft] = useState({ nama: PRINTING_ITEM_OPTIONS[0], jumlah: '', satuan: 'Bag' });
+      const [stockPrintData, setStockPrintData] = useState(null);
+
+      // ==========================================
+      // RIWAYAT CETAK (tersimpan LOKAL di perangkat masing-masing, via localStorage —
+      // BUKAN dikirim/disimpan ke server/Cloud, jadi tiap HP/laptop punya riwayatnya sendiri)
+      // ==========================================
+      // Setiap entri diberi "type" ('premix' / 'stock') supaya riwayat Premix dan Catatan
+      // Stok bisa selalu dipisahkan/difilter dengan jelas dan TIDAK tercampur saat ditampilkan.
+      const PRINT_HISTORY_KEY = 'tarobun_print_history_v1';
+      const [printHistory, setPrintHistory] = useState(() => {
+        try {
+          const raw = localStorage.getItem(PRINT_HISTORY_KEY);
+          const parsed = raw ? JSON.parse(raw) : [];
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (err) {
+          console.error('Gagal membaca riwayat cetak lokal:', err);
+          return [];
+        }
+      });
+      const [printHistoryFilter, setPrintHistoryFilter] = useState('all'); // 'all' | 'premix' | 'stock'
+      const [confirmDeleteHistoryId, setConfirmDeleteHistoryId] = useState(null);
+      const [confirmClearHistoryType, setConfirmClearHistoryType] = useState(null); // null | 'all' | 'premix' | 'stock'
+
+      const persistPrintHistory = (list) => {
+        try {
+          localStorage.setItem(PRINT_HISTORY_KEY, JSON.stringify(list));
+        } catch (err) {
+          console.error('Gagal menyimpan riwayat cetak lokal:', err);
+        }
+      };
+
+      const saveToPrintHistory = (type, data) => {
+        setPrintHistory(prev => {
+          const entry = { id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, type, data, savedAt: new Date().toISOString() };
+          // Batasi 200 entri terakhir per device supaya localStorage tidak membengkak.
+          const next = [entry, ...prev].slice(0, 200);
+          persistPrintHistory(next);
+          return next;
+        });
+      };
+
+      const deletePrintHistoryItem = (id) => {
+        setPrintHistory(prev => {
+          const next = prev.filter(h => h.id !== id);
+          persistPrintHistory(next);
+          return next;
+        });
+        setConfirmDeleteHistoryId(null);
+      };
+
+      const clearPrintHistory = (type) => {
+        setPrintHistory(prev => {
+          const next = type === 'all' ? [] : prev.filter(h => h.type !== type);
+          persistPrintHistory(next);
+          return next;
+        });
+        setConfirmClearHistoryType(null);
+      };
+
+      const handlePremixFormChange = (field, value) => setPremixForm(prev => ({ ...prev, [field]: value }));
+
+      const handlePremixPrint = (e) => {
+        e.preventDefault();
+        if (!premixForm.namaToko.trim() || !premixForm.namaBarang.trim() || !premixForm.tanggalBuat || !premixForm.tanggalExp) {
+          setNotification({ type: 'error', message: 'Lengkapi Nama Toko, Nama Barang, Tanggal Buat & Tanggal Exp terlebih dahulu.' });
+          return;
+        }
+        const dataToPrint = { ...premixForm };
+        // PENTING: pastikan data Catatan Stok yang lama dikosongkan lebih dulu supaya TIDAK
+        // ikut tercetak bersamaan dengan Label Premix di area cetak (lihat #thermalPrintArea).
+        setStockPrintData(null);
+        setPremixPrintData(dataToPrint);
+        // Simpan ke riwayat lokal (fitur "simpan setelah klik print") & langsung kosongkan
+        // kembali form-nya supaya siap dipakai untuk cetak berikutnya.
+        saveToPrintHistory('premix', dataToPrint);
+        setPremixForm({ namaToko: storeName || '', namaBarang: '', tanggalBuat: '', tanggalExp: '', asalBahan: '' });
+      };
+
+      // Begitu data cetak premix siap, panggil dialog print browser. Dialog print bawaan
+      // browser inilah yang berkomunikasi dengan driver printer apa pun yang terpasang di
+      // perangkat (thermal 58mm/80mm via Bluetooth/USB, maupun printer biasa/A4).
+      useEffect(() => {
+        if (premixPrintData) {
+          const t = setTimeout(() => window.print(), 150);
+          return () => clearTimeout(t);
+        }
+      }, [premixPrintData]);
+
+      const addStockNoteItem = () => {
+        const jumlahNum = Number(stockItemDraft.jumlah);
+        if (!stockItemDraft.jumlah || isNaN(jumlahNum) || jumlahNum <= 0) {
+          setNotification({ type: 'error', message: 'Isi jumlah yang valid (lebih dari 0) sebelum menambahkan item.' });
+          return;
+        }
+        setStockNoteItems(prev => [...prev, { id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, nama: stockItemDraft.nama, jumlah: jumlahNum, satuan: stockItemDraft.satuan }]);
+        setStockItemDraft(prev => ({ ...prev, jumlah: '' }));
+      };
+
+      const removeStockNoteItem = (id) => setStockNoteItems(prev => prev.filter(it => it.id !== id));
+
+      const handleStockNotePrint = () => {
+        if (!stockNoteStore.trim()) {
+          setNotification({ type: 'error', message: 'Isi Nama Toko terlebih dahulu.' });
+          return;
+        }
+        if (stockNoteItems.length === 0) {
+          setNotification({ type: 'error', message: 'Tambahkan minimal 1 item sebelum mencetak.' });
+          return;
+        }
+        const now = new Date();
+        const dataToPrint = { namaToko: stockNoteStore, items: stockNoteItems, tanggalCetak: now };
+        // PENTING: pastikan data Label Premix yang lama dikosongkan lebih dulu supaya TIDAK
+        // ikut tercetak bersamaan dengan Catatan Stok di area cetak (lihat #thermalPrintArea).
+        setPremixPrintData(null);
+        setStockPrintData(dataToPrint);
+        // Simpan ke riwayat lokal & kosongkan kembali daftar item + nama toko.
+        saveToPrintHistory('stock', { namaToko: stockNoteStore, items: stockNoteItems, tanggalCetak: now.toISOString() });
+        setStockNoteItems([]);
+        setStockNoteStore(storeName || '');
+      };
+
+      useEffect(() => {
+        if (stockPrintData) {
+          const t = setTimeout(() => window.print(), 150);
+          return () => clearTimeout(t);
+        }
+      }, [stockPrintData]);
+
+      // Setelah dialog print browser ditutup (baik jadi dicetak maupun dibatalkan), kosongkan
+      // kembali area cetak. Ini jaring pengaman tambahan (selain pengosongan di atas) supaya
+      // area cetak tidak pernah menyimpan data lama yang bisa ikut tercetak di lain waktu.
+      useEffect(() => {
+        const handleAfterPrint = () => {
+          setPremixPrintData(null);
+          setStockPrintData(null);
+        };
+        window.addEventListener('afterprint', handleAfterPrint);
+        return () => window.removeEventListener('afterprint', handleAfterPrint);
+      }, []);
+
+      // ==========================================
+      // STATUS KONEKSI JARINGAN (sisi Toko)
+      // ==========================================
+      // navigator.onLine dibaca browser dari status adapter jaringan HP/laptop (WiFi/data
+      // seluler nyala atau tidak) — instan & tanpa perlu request apapun ke server, jadi paling
+      // ringan untuk hal ini. Event 'online'/'offline' otomatis dipicu browser begitu status
+      // berubah, sehingga badge di header selalu akurat real-time tanpa polling tambahan.
+      // (Ini beda dari "presence" di atas yang melacak status LOGIN toko untuk dilihat Admin;
+      // yang ini murni indikator lokal untuk toko sendiri melihat koneksi internetnya sendiri.)
+      const [isNetworkOnline, setIsNetworkOnline] = useState(navigator.onLine);
+      useEffect(() => {
+        const goOnline = () => setIsNetworkOnline(true);
+        const goOffline = () => setIsNetworkOnline(false);
+        window.addEventListener('online', goOnline);
+        window.addEventListener('offline', goOffline);
+        return () => {
+          window.removeEventListener('online', goOnline);
+          window.removeEventListener('offline', goOffline);
+        };
+      }, []);
+
+      // ==========================================
+      // REAL-TIME PRESENCE: status online/offline toko
+      // ==========================================
+      // Sebelumnya pakai .info/connected + presenceRef.onDisconnect() bawaan
+      // Firebase, yang mengharuskan koneksi WebSocket ke Firebase tetap terbuka.
+      // Di banyak jaringan seluler, WebSocket ini suka diblokir/lambat/putus-nyambung
+      // (lihat catatan restUrlFor di atas), sehingga status "online" toko sering
+      // gagal terkirim sama sekali — inilah penyebab bug "toko sudah login tapi di
+      // Admin masih Offline". Sekarang diganti HEARTBEAT lewat HTTPS biasa (REST,
+      // via restSet — sama seperti seluruh proses simpan lain di app ini): toko
+      // mengirim "saya online" tiap PRESENCE_HEARTBEAT_MS, dan Admin menganggap
+      // toko online selama heartbeat terakhirnya masih segar (lihat AdminPanel).
+      // Kalau tab ditutup/koneksi putus mendadak, heartbeat berhenti dan status
+      // otomatis "meluruh" jadi Offline dengan sendirinya di sisi Admin — tanpa
+      // perlu event disconnect apa pun dari Firebase.
+      // Logout paksa dari server: dipicu kalau (a) device ini sendiri tidak mengirim heartbeat
+      // (tab ditutup/laptop mati) selama lebih dari 5 jam, ATAU (b) Admin mengeluarkan device
+      // ini secara manual lewat menu "Perangkat" di Panel Admin. TIDAK ADA lagi limit jumlah
+      // device per toko — toko boleh login di berapa pun device sekaligus.
+      const forceKickedLogout = (reason) => {
+        const msg = reason === 'inactive-timeout'
+          ? '⏱️ Sesi Anda otomatis berakhir karena web ini tidak dibuka/aktif selama lebih dari 5 jam. Silakan login kembali.'
+          : '⚠️ Sesi di perangkat ini telah dikeluarkan (logout paksa) oleh Admin. Silakan login kembali.';
+        alert(msg);
+        onLogout();
+      };
+
+      useEffect(() => {
+        // OPTIMASI (2026-07-19): sebelumnya restSet ke db.ref('storesPresence/...') yang
+        // menulis ke D1 tiap heartbeat — untuk 100 toko ini gampang lewat limit gratis
+        // 100.000 Rows Written/hari. Sekarang heartbeat langsung ke Durable Object
+        // (in-memory, 0 Rows D1), jadi seberapa pun sering/banyak toko, tidak numpang ke
+        // limit D1 sama sekali.
+        // FITUR BARU (2026-07-20): heartbeat ini SEKALIGUS "menumpang" untuk mengecek limit
+        // 2 device/toko & auto-logout tidak aktif 5 jam (deviceId dikirim, server membalas
+        // deviceValid:false kalau sesi device ini sudah tidak berlaku) — sengaja digabung ke
+        // request yang sudah ada ini (bukan bikin endpoint/polling baru) supaya tetap efisien
+        // dan tetap murni HTTP biasa, bukan WebSocket.
+        let stoppedByServer = false;
+        const sendHeartbeat = () => {
+          __apiFetch(`${WORKER_BASE}/api/presence/ping`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ storeId, storeName, deviceId: getDeviceId() }),
+          }).then(res => res.json()).then(data => {
+            if (data && data.deviceValid === false && !stoppedByServer) {
+              stoppedByServer = true;
+              forceKickedLogout(data.reason);
+            }
+          }).catch((err) => console.error('Gagal update status online toko:', err));
+        };
+
+        sendHeartbeat(); // kirim segera begitu toko login / halaman dibuka
+        const interval = setInterval(sendHeartbeat, PRESENCE_HEARTBEAT_MS);
+
+        // Kirim ulang segera begitu tab kembali aktif (mis. user balik dari app lain
+        // atau layar HP dinyalakan lagi), supaya status "online" langsung update
+        // tanpa perlu menunggu interval heartbeat berikutnya.
+        const onVisible = () => { if (document.visibilityState === 'visible') sendHeartbeat(); };
+        document.addEventListener('visibilitychange', onVisible);
+        window.addEventListener('focus', onVisible);
+
+        return () => {
+          clearInterval(interval);
+          document.removeEventListener('visibilitychange', onVisible);
+          window.removeEventListener('focus', onVisible);
+        };
+      }, [storeId, storeName]);
+
+      // ==========================================
+      // POP-UP NOTIFIKASI UPDATE SISTEM DARI ADMIN
+      // ==========================================
+      const [systemUpdate, setSystemUpdate] = useState(null);
+      const [showUpdatePopup, setShowUpdatePopup] = useState(false);
+
+      useEffect(() => {
+        const ref = db.ref('systemUpdates/latest');
+        return bindLiveValue(ref, (snap) => {
+          const data = snap.val();
+          if (!data || !data.id) return;
+          // BUGFIX (2026-07-20): dulu pop-up ini muncul di SEMUA toko tanpa memeriksa
+          // target, walau admin sudah memilih hanya sebagian toko di menu Update Web.
+          // targetStoreIds null/kosong = memang untuk SEMUA toko (perilaku broadcast lama);
+          // kalau berisi daftar storeId, toko ini harus ada di dalamnya baru pop-up muncul.
+          if (Array.isArray(data.targetStoreIds) && !data.targetStoreIds.includes(storeId)) return;
+          const seenId = localStorage.getItem('tarobun_seen_update_id');
+          if (seenId !== String(data.id)) {
+            setSystemUpdate(data);
+            setShowUpdatePopup(true);
+          }
+        });
+      }, [storeId]);
+
+      const dismissSystemUpdate = () => {
+        if (systemUpdate) localStorage.setItem('tarobun_seen_update_id', String(systemUpdate.id));
+        setShowUpdatePopup(false);
+      };
+
+      // Re-initialize icons on every render
+useEffect(() => {
+  // Pastikan objek lucide ada di window sebelum digunakan
+  if (window.lucide) {
+    window.lucide.createIcons();
+  }
+}, [activeTab]);
+      // Configuration states (Saved in LocalStorage / Firebase fallback)
+      const [config, setConfig] = useState({
+        telegramBotToken: '',
+        telegramChatId: '',
+        googleAppScriptUrl: ''
+      });
+
+      // Default empty templates
+      const getEmptySalesState = (dateStr = new Date().toISOString().split('T')[0]) => ({
+        tanggal: dateStr,
+        suhuFreezer: '',
+        suhuChiller: '',
+        soldBuns: {
+          original: '',
+          coklat: '',
+          vanilla: '',
+          peach: '',
+          lemon: '',
+          raspberry: '',
+          nanas: '',
+          familyBox: ''
+        },
+        soldBeverages: {
+          taroLatte: '',
+          chocolateIced: '',
+          taroStrawberryCheese: '',
+          taroBlueberry: ''
+        },
+        financials: {
+          value: '',
+          cash: '',
+          edc: '',
+          grab: '',
+          shopeeFood: '',
+          goFood: '',
+          transaksi: ''
+        },
+        waste: {
+          fdNempel: '',
+          bunRejectThawing: '',
+          doughPecahProofing: '',
+          doughGagalBaking: '',
+          rotiMatang: '',
+          wasteBun: ''
+        },
+        custom: {} // field tambahan yang didefinisikan Admin (Form Builder)
+      });
+
+      const getEmptyInventoryState = (dateStr = new Date().toISOString().split('T')[0]) => ({
+        tanggal: dateStr,
+        frozenDough: '',
+        toppingTaro: '',
+        fillingCoklat: '',
+        fillingVanilla: '',
+        fillingLemon: '',
+        fillingPeach: '',
+        fillingRaspberry: '',
+        fillingNanas: '',
+        
+        // Ingredients
+        uht: '',
+        taroPowder: '',
+        coklatPowder: '',
+        whippingCream: '',
+        ndcPowder: '',
+        cheesePowder: '',
+        strawberryKonsentrat: '',
+        strawberrySyrup: '',
+        blueberryKonsentrat: '',
+
+        // Packaging & Operations
+        paperPouch: '',
+        familyPack: '',
+        plastik20: '',
+        plastik25: '',
+        plastik35: '',
+        cupbler22: '',
+        cuplid22: '',
+        cupTrayS: '',
+        cupTrayM: '',
+        glovesM: '',
+        glovesL: '',
+        glovesXL: '',
+        trashBag: '',
+        thermalPaper: '',
+        kuraflexHijau: '',
+        kuraflexPink: '',
+        kitchenMask: '',
+        tisuKecil: '',
+        tisuBesar: '',
+        custom: {} // field tambahan yang didefinisikan Admin (Form Builder)
+      });
+
+      const [salesData, setSalesData] = useState(() => getEmptySalesState());
+      const [inventoryData, setInventoryData] = useState(() => getEmptyInventoryState());
+      const [historyList, setHistoryList] = useState([]);
+      const [customSalesFields, setCustomSalesFields] = useState([]);
+      const [customInventoryFields, setCustomInventoryFields] = useState([]);
+
+      // ==========================================
+      // VALIDASI FIELD KOSONG — SO Harian / Laporan Penjualan (2026-08-06)
+      // ==========================================
+      // Aturan: "Simpan di Cloud" boleh tetap jalan walau ada field kosong (cuma dikasih
+      // PEMBERITAHUAN field apa saja yang belum terisi). Tapi kalau mau langsung "Kirim
+      // Telegram"/"Kirim WA", field WAJIB terisi — kalau memang sengaja kosong, otomatis
+      // diisi 0 (dengan konfirmasi dulu) sebelum dikirim, supaya laporan yang terkirim
+      // selalu lengkap angkanya.
+      const humanizeFieldKey = (key) => {
+        const spaced = String(key).replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/_/g, ' ');
+        return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+      };
+      const SALES_SECTION_LABELS = {
+        soldBuns: 'Roti Terjual', soldBeverages: 'Minuman', financials: 'Keuangan', waste: 'Waste',
+      };
+      // Kumpulkan semua field angka (termasuk yang bersarang seperti soldBuns.original) jadi
+      // daftar datar {label, value, path, setPath} supaya gampang dicek kosong/tidaknya DAN
+      // gampang diisi ulang otomatis dengan 0 tanpa perlu tahu strukturnya di tempat lain.
+      const flattenReportFields = (obj, sectionLabels) => {
+        const out = [];
+        Object.keys(obj || {}).forEach(key => {
+          if (key === 'tanggal' || key === 'custom') return;
+          const val = obj[key];
+          if (val && typeof val === 'object' && !Array.isArray(val)) {
+            const secLabel = (sectionLabels && sectionLabels[key]) || humanizeFieldKey(key);
+            Object.keys(val).forEach(subKey => {
+              out.push({ value: val[subKey], label: `${secLabel} - ${humanizeFieldKey(subKey)}`, group: key, sub: subKey });
+            });
+          } else {
+            out.push({ value: val, label: humanizeFieldKey(key), group: null, sub: key });
+          }
+        });
+        return out;
+      };
+      const isFieldEmpty = (v) => v === '' || v === null || typeof v === 'undefined';
+
+      // Menghasilkan daftar field yang masih kosong dari salesData + inventoryData saat ini
+      // (dipanggil ulang tiap kali mau simpan/kirim, bukan lewat useMemo, supaya selalu pakai
+      // nilai TERBARU persis saat tombol ditekan).
+      const getEmptyReportFields = () => {
+        const salesFields = flattenReportFields(salesData, SALES_SECTION_LABELS).map(f => ({ ...f, section: 'sales', sectionLabel: 'Laporan Penjualan' }));
+        const invFields = flattenReportFields(inventoryData, {}).map(f => ({ ...f, section: 'inventory', sectionLabel: 'SO Stok' }));
+        const customSales = (customSalesFields || []).filter(f => f.type !== 'text').map(f => ({
+          value: (salesData.custom || {})[f.id], label: f.label, section: 'sales', sectionLabel: 'Laporan Penjualan', group: 'custom', sub: f.id,
+        }));
+        const customInv = (customInventoryFields || []).filter(f => f.type !== 'text').map(f => ({
+          value: (inventoryData.custom || {})[f.id], label: f.label, section: 'inventory', sectionLabel: 'SO Stok', group: 'custom', sub: f.id,
+        }));
+        return [...salesFields, ...customSales, ...invFields, ...customInv].filter(f => isFieldEmpty(f.value));
+      };
+
+      // Isi 0 ke SEMUA field yang masih kosong (dipanggil setelah Admin/toko konfirmasi mau
+      // lanjut kirim walau ada yang kosong) — mengembalikan salesData & inventoryData baru.
+      const fillEmptyReportFieldsWithZero = (emptyFields) => {
+        const newSales = JSON.parse(JSON.stringify(salesData));
+        const newInv = JSON.parse(JSON.stringify(inventoryData));
+        emptyFields.forEach(f => {
+          const target = f.section === 'sales' ? newSales : newInv;
+          if (f.group === 'custom') {
+            target.custom = target.custom || {};
+            target.custom[f.sub] = 0;
+          } else if (f.group) {
+            target[f.group] = target[f.group] || {};
+            target[f.group][f.sub] = 0;
+          } else {
+            target[f.sub] = 0;
+          }
+        });
+        return { newSales, newInv };
+      };
+
+      // Dipakai untuk banner notifikasi non-blocking di tab Sales & Inventory — dihitung ulang
+      // tiap render (murah, jumlah field terbatas) supaya selalu sinkron dengan input terbaru.
+      const emptyReportFieldsPreview = getEmptyReportFields();
+
+      // Modal konfirmasi "field kosong" khusus saat mau KIRIM (Telegram/WA) — beda dengan Simpan
+      // yang tidak butuh konfirmasi apa pun.
+      const [pendingSendAction, setPendingSendAction] = useState(null); // 'telegram' | 'wa' | null
+      const [showEmptyFieldsSendModal, setShowEmptyFieldsSendModal] = useState(false);
+      const [emptyFieldsForModal, setEmptyFieldsForModal] = useState([]);
+
+      // Field tambahan pada Laporan Penjualan & SO Stok yang dikelola Admin (Form Builder di Panel Admin).
+      // Ini memungkinkan Admin menambah/mengubah/menghapus pertanyaan form tanpa mengubah kode.
+      useEffect(() => {
+        const salesFieldsRef = db.ref('formSchemas/sales');
+        const invFieldsRef = db.ref('formSchemas/inventory');
+        // Field custom hanya ditampilkan di toko ini kalau tidak ada target toko sama sekali
+        // (berarti berlaku untuk semua toko / perilaku lama) ATAU toko ini ada di daftar target.
+        const belongsToThisStore = (field) => !field.storeIds || field.storeIds.length === 0 || field.storeIds.includes(storeId);
+        const salesHandler = (snap) => {
+          const data = snap.val() || {};
+          setCustomSalesFields(Object.keys(data).map(id => ({ id, ...data[id] })).filter(belongsToThisStore));
+        };
+        const invHandler = (snap) => {
+          const data = snap.val() || {};
+          setCustomInventoryFields(Object.keys(data).map(id => ({ id, ...data[id] })).filter(belongsToThisStore));
+        };
+        const unbindSales = bindLiveValue(salesFieldsRef, salesHandler);
+        const unbindInv = bindLiveValue(invFieldsRef, invHandler);
+        return () => { unbindSales(); unbindInv(); };
+      }, []);
+
+      // ==========================================
+      // PANDUAN SOP - STATE (Sisi Store)
+      // ==========================================
+      const [sopCategories, setSopCategories] = useState([]);
+      const [selectedSopCategory, setSelectedSopCategory] = useState(null);
+      const [sopLightboxUrl, setSopLightboxUrl] = useState(null);
+
+      useEffect(() => {
+        const ref = db.ref('sopCategories');
+        const belongsToThisStore = (cat) => !cat.storeIds || cat.storeIds.length === 0 || cat.storeIds.includes(storeId);
+        const handler = (snap) => {
+          const data = snap.val() || {};
+          const list = Object.keys(data).map(id => {
+            const c = data[id] || {};
+            const media = c.media ? Object.keys(c.media).map(mid => ({ id: mid, ...c.media[mid] })) : [];
+            media.sort((a, b) => (a.addedAt || 0) - (b.addedAt || 0));
+            return { id, name: c.name || '(Tanpa Nama)', content: c.content || '', storeIds: c.storeIds || [], media, createdAt: c.createdAt || 0 };
+          }).filter(belongsToThisStore);
+          list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+          setSopCategories(list);
+        };
+        return bindLiveValue(ref, handler);
+      }, []);
+
+      // Sinkronkan kategori yang sedang dibuka kalau ada perubahan real-time dari Admin
+      useEffect(() => {
+        if (!selectedSopCategory) return;
+        const updated = sopCategories.find(c => c.id === selectedSopCategory.id);
+        if (updated) setSelectedSopCategory(updated);
+        else setSelectedSopCategory(null);
+      }, [sopCategories]);
+
+      // ==========================================
+      // DATANG BARANG - STATE & MASTER DATA
+      // ==========================================
+      // Daftar barang "Kop Khusus" -> Frozen Dough s/d Filling (butuh no. faktur/surat jalan)
+      const KEDATANGAN_KOP_KHUSUS_ITEMS = [
+        { key: 'frozenDough', label: 'Frozen Dough', unit: 'pcs' },
+        { key: 'toppingTaro', label: 'Topping Taro', unit: 'kg' },
+        { key: 'taroPowder', label: 'Taro Powder', unit: 'kg' },
+        { key: 'fillingCoklat', label: 'Filling Coklat', unit: 'kg' },
+        { key: 'fillingVanilla', label: 'Filling Vanilla', unit: 'kg' },
+        { key: 'fillingRaspberry', label: 'Filling Raspberry', unit: 'kg' },
+        { key: 'fillingLemon', label: 'Filling Lemon', unit: 'kg' },
+        { key: 'fillingPeach', label: 'Filling Peach', unit: 'kg' },
+        { key: 'fillingNanas', label: 'Filling Nanas', unit: 'kg' },
+      ];
+
+      // Daftar barang umum (non kop khusus)
+      const KEDATANGAN_BARANG_UMUM_ITEMS = [
+        { key: 'whippingCream', label: 'Whipping Cream', unit: 'pcs' },
+        { key: 'ndcPowder', label: 'NDC Powder', unit: 'pack' },
+        { key: 'PaperPouch', label: 'Paper Pouch', unit: 'pcs' },
+        { key: 'familyPack', label: 'Family Pack', unit: 'pack' },
+        { key: 'cupLid22', label: 'Cup Lid 22 oz', unit: 'pack' },
+        { key: 'cupbler22', label: 'Cupbler 22 oz', unit: 'pack' },
+        { key: 'thermalPaper', label: 'Thermal Paper', unit: 'pack' },
+        { key: 'plastikUK20', label: 'Plastik UK 20', unit: 'pack' },
+        { key: 'plastikUK25', label: 'Plastik UK 25', unit: 'pack' },
+        { key: 'plastikUK35', label: 'Plastik UK 35', unit: 'pack' },
+        { key: 'TrashBag', label: 'Trash Bag', unit: 'pack' },
+        { key: 'strawberrySyrup', label: 'Strawberry Syrup', unit: 'kg' },
+        { key: 'konsentratStrawberry', label: 'Konsentrat Strawberry', unit: 'kg' },
+        { key: 'konsentratBlueberry', label: 'Konsentrat Blueberry', unit: 'kg' },
+        { key: 'cheeseFoamPowder', label: 'Cheese Foam Powder', unit: 'pack' },
+        { key: 'kuraflexMerah', label: 'Kuraflex Merah', unit: 'pack' },
+        { key: 'kuraflexHijau', label: 'Kuraflex Hijau', unit: 'pack' },
+        { key: 'tissueSmall', label: 'Tissue Small', unit: 'pack' },
+        { key: 'tissueLarge', label: 'Tissue Large', unit: 'pack' },
+      ];
+
+      const getEmptyKedatanganForm = (dateStr = new Date().toISOString().split('T')[0]) => ({
+        tanggal: dateStr,
+        noSuratJalan: '', // Kop Khusus / No. Faktur Surat Jalan
+        items: {}, // { itemKey: jumlah }
+        tidakSesuai: [], // [{ id, nama, jumlah, satuan, keterangan }]
+      });
+
+      const [kedatanganForm, setKedatanganForm] = useState(() => getEmptyKedatanganForm());
+      const [kedatanganHistoryList, setKedatanganHistoryList] = useState([]);
+      const [isSavingKedatangan, setIsSavingKedatangan] = useState(false);
+      const [tidakSesuaiInput, setTidakSesuaiInput] = useState({ nama: '', jumlah: '', satuan: 'pcs', keterangan: '' });
+
+      // ==========================================
+      // BAP (LAPORAN SELISIH TRANSAKSI) - STATE & MASTER DATA
+      // ==========================================
+      // BAP dipakai untuk melaporkan selisih nominal antara catatan POS toko dengan nominal
+      // yang tercatat di masing-masing channel pembayaran/pesan-antar (EDC, QRIS, Gofood,
+      // GrabFood, ShopeeFood), lalu dikirim ke Telegram sebagai berita acara.
+      const BAP_TRANSAKSI_OPTIONS = ['EDC BCA', 'Qris BCA', 'Gofood', 'GrabFood', 'ShopeeFood'];
+
+      const getEmptyBapForm = (dateStr = new Date().toISOString().split('T')[0]) => ({
+        tanggal: dateStr,
+        transaksi: BAP_TRANSAKSI_OPTIONS[0],
+        nominalPos: '',
+        nominalChannel: '',
+        keterangan: '',
+      });
+
+      const [bapForm, setBapForm] = useState(() => getEmptyBapForm());
+      const [bapHistoryList, setBapHistoryList] = useState([]);
+      const [isSavingBap, setIsSavingBap] = useState(false);
+      // true selama keterangan belum diedit manual oleh user — teksnya ikut menyesuaikan
+      // otomatis setiap nominal POS/channel berubah. Begitu user mengetik sendiri di kolom
+      // keterangan, flag ini dimatikan supaya tulisan manualnya tidak ditimpa lagi.
+      const [bapKeteranganAuto, setBapKeteranganAuto] = useState(true);
+
+      // Menu sidebar (hamburger)
+      const [showMenu, setShowMenu] = useState(false);
+
+      // ==========================================
+      // FOTO WASTE / RIJEK - STATE
+      // ==========================================
+      const WASTE_CATEGORIES = {
+        bunRijek: { label: 'Foto Bun Rijek', short: 'Bun Rijek', color: 'rose', icon: 'image-off' },
+        rijekBarang: { label: 'Foto Rijek Barang', short: 'Rijek Barang', color: 'amber', icon: 'package-x' },
+        bunWaste: { label: 'Foto Bun Waste', short: 'Bun Waste', color: 'orange', icon: 'trash' }
+      };
+
+      // Tailwind CDN (JIT) hanya mendeteksi nama class literal di source, bukan hasil interpolasi string.
+      // Karena itu seluruh kombinasi warna per kategori didaftarkan statis di sini agar style tetap muncul.
+      const WASTE_COLOR_STYLES = {
+        rose: {
+          activeBtn: 'bg-rose-600 text-white border-rose-600 shadow-sm',
+          cardBorder: 'border-rose-100',
+          cardBg: 'bg-rose-50/40',
+          icon: 'text-rose-600',
+          badge: 'bg-rose-100 text-rose-800'
+        },
+        amber: {
+          activeBtn: 'bg-amber-600 text-white border-amber-600 shadow-sm',
+          cardBorder: 'border-amber-100',
+          cardBg: 'bg-amber-50/40',
+          icon: 'text-amber-600',
+          badge: 'bg-amber-100 text-amber-800'
+        },
+        orange: {
+          activeBtn: 'bg-orange-600 text-white border-orange-600 shadow-sm',
+          cardBorder: 'border-orange-100',
+          cardBg: 'bg-orange-50/40',
+          icon: 'text-orange-600',
+          badge: 'bg-orange-100 text-orange-800'
+        }
+      };
+
+      const getEmptyWasteFotoForm = () => ({
+        kategori: 'bunRijek',
+        jumlah: '',
+        keterangan: '',
+        fotoPreview: null, // compressed base64 untuk preview & kirim
+      });
+
+      const [wasteFotoForm, setWasteFotoForm] = useState(() => getEmptyWasteFotoForm());
+      const [wasteFotoList, setWasteFotoList] = useState([]);
+      const [isCompressingFoto, setIsCompressingFoto] = useState(false);
+      const [isSavingFoto, setIsSavingFoto] = useState(false);
+      const [sendingCategory, setSendingCategory] = useState(null);
+      // Tanggal riwayat yang sedang ditampilkan di tab Foto Rijek (default: hari ini)
+      const [wasteFotoViewDate, setWasteFotoViewDate] = useState(() => new Date().toISOString().split('T')[0]);
+
+      // ==========================================
+      // MENU: PRE ORDER PESANAN (2026-07-20)
+      // ==========================================
+      const getEmptyPreOrderForm = () => ({
+        tanggalPesanan: new Date().toISOString().split('T')[0],
+        namaPemesan: '',
+        isiPesanan: '',
+        buktiPreview: null, // bukti pembayaran/struk, base64 hasil kompresi untuk preview & kirim
+        pickupTanggal: new Date().toISOString().split('T')[0],
+        pickupJam: '',
+        metodePickup: 'ambilSendiri', // 'ojol' | 'ambilSendiri'
+      });
+      const [preOrderForm, setPreOrderForm] = useState(() => getEmptyPreOrderForm());
+      const [preOrderList, setPreOrderList] = useState([]);
+      const [isCompressingBukti, setIsCompressingBukti] = useState(false);
+      const [isSavingPreOrder, setIsSavingPreOrder] = useState(false);
+
+      // Toast notification helper
+      const showToast = (message) => {
+        setNotification(message);
+        setTimeout(() => setNotification(null), 3000);
+      };
+
+      // --- INTEGRASI REALTIME FIREBASE ---
+      // Menggantikan proses pembacaan localstorage agar sinkron antar user secara live!
+      useEffect(() => {
+        // 1. Tarik Data History secara Real-time dari Node 'history'
+        const historyRef = db.ref(`${storeBase}/history`).limitToLast(150);
+        const unbindHistory = bindLiveValue(historyRef, (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            // Mengubah format Object Firebase { id1: data1, id2: data2 } menjadi Array sorted terbaru di atas
+            const formattedList = Object.keys(data).map(key => ({
+              ...data[key],
+              firebaseKey: key // simpan key firebase untuk mempermudah hapus data
+            })).sort((a, b) => b.tanggal.localeCompare(a.tanggal));
+            
+            setHistoryList(formattedList);
+          } else {
+            setHistoryList([]);
+          }
+        }, (err) => {
+          // Jika akses ditolak (misal akun toko dihapus/dinonaktifkan admin saat sesi berjalan), paksa logout
+          console.error(err);
+          if (err.code === 'PERMISSION_DENIED') { clearSession(); auth.signOut(); }
+        });
+
+        // 2. Load Config Web dari localstorage untuk field selain Telegram (mis. Google Apps Script URL)
+        const savedConfig = localStorage.getItem('tarobun_config_web');
+        if (savedConfig) {
+          try {
+            const parsed = JSON.parse(savedConfig);
+            delete parsed.telegramBotToken;
+            delete parsed.telegramChatId;
+            setConfig(prev => ({ ...prev, ...parsed }));
+          } catch (e) { /* abaikan config lama yang rusak */ }
+        }
+
+        // 2b. Bot Token & Chat ID Telegram sekarang HANYA diatur oleh Admin (bukan lagi oleh toko).
+        // Ambil real-time dari Firebase agar begitu admin mengubahnya, toko langsung dapat versi terbaru.
+        const tgRef = db.ref(`${storeBase}/telegramConfig`);
+        const unbindTg = bindLiveValue(tgRef, (snap) => {
+          const tg = snap.val() || {};
+          setConfig(prev => ({ ...prev, telegramBotToken: tg.botToken || '', telegramChatId: tg.chatId || '' }));
+        });
+
+        // 3. Tarik Data Foto Waste/Rijek secara Real-time dari Node 'wasteFotos'
+        const wasteFotoRef = db.ref(`${storeBase}/wasteFotos`).limitToLast(150);
+        const unbindWaste = bindLiveValue(wasteFotoRef, (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            const formattedList = Object.keys(data).map(key => ({
+              ...data[key],
+              firebaseKey: key
+            })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            setWasteFotoList(formattedList);
+          } else {
+            setWasteFotoList([]);
+          }
+        });
+
+        // 4. Tarik Data Kedatangan Barang secara Real-time dari Node 'kedatanganBarang'
+        const kedatanganRef = db.ref(`${storeBase}/kedatanganBarang`).limitToLast(150);
+        const unbindKedatangan = bindLiveValue(kedatanganRef, (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            const formattedList = Object.keys(data).map(key => ({
+              ...data[key],
+              firebaseKey: key
+            })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            setKedatanganHistoryList(formattedList);
+          } else {
+            setKedatanganHistoryList([]);
+          }
+        });
+
+        // 5. Tarik Data BAP (Laporan Selisih Transaksi) secara Real-time dari Node 'bapReports'
+        const bapRef = db.ref(`${storeBase}/bapReports`).limitToLast(150);
+        const unbindBap = bindLiveValue(bapRef, (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            const formattedList = Object.keys(data).map(key => ({
+              ...data[key],
+              firebaseKey: key
+            })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            setBapHistoryList(formattedList);
+          } else {
+            setBapHistoryList([]);
+          }
+        });
+
+        // 6. Tarik Data Pre Order Pesanan secara Real-time dari Node 'preOrders'
+        const preOrderRef = db.ref(`${storeBase}/preOrders`).limitToLast(150);
+        const unbindPreOrder = bindLiveValue(preOrderRef, (snapshot) => {
+          const data = snapshot.val();
+          if (data) {
+            const formattedList = Object.keys(data).map(key => ({
+              ...data[key],
+              firebaseKey: key
+            })).sort((a, b) => (a.pickupAt || 0) - (b.pickupAt || 0));
+            setPreOrderList(formattedList);
+          } else {
+            setPreOrderList([]);
+          }
+        });
+
+        // Clean up listener saat component unmount
+        return () => {
+          unbindHistory();
+          unbindTg();
+          unbindWaste();
+          unbindKedatangan();
+          unbindBap();
+          unbindPreOrder();
+        };
+      }, []);
+
+      // 5. Auto-hapus data toko ini yang usianya lebih dari 30 hari, agar Cloud & aplikasi tetap ringan.
+      // Dibatasi maksimal 1x per 24 jam (lihat shouldRunPruneNow) — kalau staff login/refresh
+      // berkali-kali sehari, tidak perlu baca ulang seluruh riwayat toko itu tiap kali.
+      useEffect(() => {
+        if (!shouldRunPruneNow(`store_${storeId}`)) return;
+        pruneOldEntries(db.ref(`${storeBase}/history`), (item) => item.tanggal ? new Date(item.tanggal).getTime() : (item.createdAt || 0));
+        pruneOldEntries(db.ref(`${storeBase}/wasteFotos`), (item) => item.createdAt || (item.tanggal ? new Date(item.tanggal).getTime() : 0), (item) => item.fotoKey ? [item.fotoKey] : []);
+        pruneOldEntries(db.ref(`${storeBase}/preOrders`), (item) => item.createdAt || item.pickupAt || 0, (item) => item.buktiKey ? [item.buktiKey] : []);
+        pruneOldEntries(db.ref(`${storeBase}/kedatanganBarang`), (item) => item.createdAt || (item.tanggal ? new Date(item.tanggal).getTime() : 0));
+        pruneOldEntries(db.ref(`${storeBase}/bapReports`), (item) => item.createdAt || (item.tanggal ? new Date(item.tanggal).getTime() : 0));
+        // Chat sudah pindah ke /api/chat (D1) — retensi 30 harinya otomatis di server.
+      }, [storeId]);
+
+      // 6. Notifikasi pesan chat baru dari admin (badge merah + toast + notifikasi browser)
+      const activeTabRef = React.useRef(activeTab);
+      useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+      const chatInitializedRef = React.useRef(false);
+      const lastSeenAdminMsgIdRef = React.useRef(null);
+      useEffect(() => {
+        // OPTIMASI (2026-07-19): sebelumnya db.ref('chats/...').limitToLast(30) yang
+        // limit-nya kosmetik (tetap baca semua riwayat di server). Sekarang cukup poll
+        // ringkasan 1 baris (/api/chat/summary), jauh lebih murah.
+        let stopped = false;
+        const refreshSummary = async () => {
+          if (stopped) return;
+          try {
+            const res = await __apiFetch(`${WORKER_BASE}/api/chat/summary`, { headers: __authHeaders() });
+            const data = await res.json();
+            const s = data.summary;
+            if (s) {
+              setUnreadChat(s.unread_for_store || 0);
+              if (chatInitializedRef.current && s.last_sender === 'admin' && s.last_message_id !== lastSeenAdminMsgIdRef.current) {
+                if (activeTabRef.current !== 'chat') {
+                  showToast(`💬 Pesan baru dari Admin: "${(s.last_text || '').slice(0, 60)}${(s.last_text || '').length > 60 ? '…' : ''}"`);
+                }
+                playNotificationSound();
+                sendBrowserNotification('Pesan baru dari Admin', s.last_text || '');
+              }
+              if (s.last_message_id) lastSeenAdminMsgIdRef.current = s.last_message_id;
+              chatInitializedRef.current = true;
+            }
+          } catch (e) { /* coba lagi lewat safety interval / long-poll berikutnya */ }
+        };
+        refreshSummary(); // muat langsung saat pertama render
+        // REAL-TIME: begitu Admin kirim balasan, worker langsung "membangunkan" long-poll
+        // ini lewat ChatHub (bukan nunggu interval 15 detik lagi).
+        const poller = createChatLongPoll({ storeId, onChange: refreshSummary });
+        // Jaring pengaman kalau-kalau ada momen bangun-tidur yang kelewat.
+        const safetyInterval = setInterval(refreshSummary, 60000);
+        return () => { stopped = true; poller.stop(); clearInterval(safetyInterval); };
+      }, [storeId]);
+
+      const numVal = (val) => {
+        const parsed = parseFloat(val);
+        return isNaN(parsed) ? 0 : parsed;
+      };
+
+      // Dashboard Calculations for Buns
+      const calculateTotalBunsSold = (buns) => {
+        const individual = 
+          numVal(buns.original) + 
+          numVal(buns.coklat) + 
+          numVal(buns.vanilla) + 
+          numVal(buns.peach) + 
+          numVal(buns.lemon) + 
+          numVal(buns.raspberry) +
+          numVal(buns.nanas);
+        const boxTotal = numVal(buns.familyBox) * 6;
+        return individual + boxTotal;
+      };
+
+      const totalBunsSold = calculateTotalBunsSold(salesData.soldBuns);
+
+      const calculateTotalBeveragesSold = (bevs) => {
+        return Object.values(bevs).reduce((a, b) => numVal(a) + numVal(b), 0);
+      };
+
+      const totalBeveragesSold = calculateTotalBeveragesSold(salesData.soldBeverages);
+
+      // Usage Formulas (Dough & Fillings) -> KG
+      const toppingTaroUsedKg = (totalBunsSold * 25) / 1000;
+      const fillingCoklatUsedKg = (numVal(salesData.soldBuns.coklat) * 25) / 1000;
+      const fillingVanillaUsedKg = (numVal(salesData.soldBuns.vanilla) * 25) / 1000;
+      const fillingPeachUsedKg = (numVal(salesData.soldBuns.peach) * 25) / 1000;
+      const fillingLemonUsedKg = (numVal(salesData.soldBuns.lemon) * 25) / 1000;
+      const fillingRaspberryUsedKg = (numVal(salesData.soldBuns.raspberry) * 25) / 1000;
+      const fillingNanasUsedKg = (numVal(salesData.soldBuns.nanas) * 25) / 1000;
+
+      // --- KULKULASI BAHAN BAKU BEVERAGES ---
+      const taroLatteSales = numVal(salesData.soldBeverages.taroLatte);
+      const taroStrawCheeseSales = numVal(salesData.soldBeverages.taroStrawberryCheese);
+      const taroBlueberrySales = numVal(salesData.soldBeverages.taroBlueberry);
+      
+      const totalAllTaroVarian = taroLatteSales + taroStrawCheeseSales + taroBlueberrySales;
+
+      const baseNdcGrams = totalAllTaroVarian * 25;
+      const baseTaroPowderGrams = totalAllTaroVarian * 40;
+      const baseUhtMl = totalAllTaroVarian * 100;
+
+      const addCheesePowderGrams = taroStrawCheeseSales * 0.48;
+      const addUhtMlStrawCheese = taroStrawCheeseSales * 9.76;
+      const addWhipCreamGramsStrawCheese = taroStrawCheeseSales * 9.76;
+      const addStrawSausGramsStrawCheese = taroStrawCheeseSales * 20;
+
+      const addStrawSyrupGramsBlueberry = taroBlueberrySales * 6;
+      const addUhtMlBlueberry = taroBlueberrySales * 12;
+      const addWhipCreamGramsBlueberry = taroBlueberrySales * 12;
+      const addBlueberrySausGrams = taroBlueberrySales * 20;
+      
+      const totalUhtVolume = baseUhtMl + addUhtMlStrawCheese + addUhtMlBlueberry;
+      const bevUhtKg = totalUhtVolume / 1000;
+
+      const totalWhippingCreamGrams = addWhipCreamGramsStrawCheese + addWhipCreamGramsBlueberry;
+      const bevWhipCreamKg = totalWhippingCreamGrams / 1000;
+
+      const bevNdcKg = baseNdcGrams / 1000;
+      const bevTaroPowderKg = baseTaroPowderGrams / 1000;
+      const bevCheesePowderKg = addCheesePowderGrams / 1000;
+      const bevStrawSyrupKg = addStrawSyrupGramsBlueberry / 1000;
+      const bevBlueberrySausKg = addBlueberrySausGrams / 1000;
+      const bevStrawSausKg = addStrawSausGramsStrawCheese / 1000;
+
+      const formatIndonesianDate = (dateStr) => {
+        if (!dateStr) return '';
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+      };
+
+      const handleClearForm = () => {
+        const today = new Date().toISOString().split('T')[0];
+        setSalesData(getEmptySalesState(today));
+        setInventoryData(getEmptyInventoryState(today));
+        showToast('Form telah dikosongkan! Siap untuk input hari baru. 🧼');
+      };
+
+      const handleSaveConfig = (e) => {
+        e.preventDefault();
+        const { telegramBotToken, telegramChatId, ...persistable } = config;
+        localStorage.setItem('tarobun_config_web', JSON.stringify(persistable));
+        showToast('Konfigurasi disimpan! ⚙️');
+        setShowConfig(false);
+      };
+
+      // --- MENGUBAH PENYIMPANAN KE CLOUD FIREBASE ---
+      const handleSaveToDevice = async () => {
+        const idEntry = salesData.tanggal; // Gunakan tanggal sebagai identifier unik atau timestamp
+        const payload = {
+          id: Date.now().toString(),
+          tanggal: salesData.tanggal,
+          totalSales: totalBunsSold,
+          revenue: numVal(salesData.financials.value),
+          sales: { ...salesData },
+          inventory: { ...inventoryData }
+        };
+
+        try {
+          showToast('Menyimpan ke Cloud Firebase... ☁️');
+          // Menggunakan sistem update berbasis tanggal agar data di tanggal yang sama ter-overwrite/diperbarui otomatis
+          await restSet(db.ref(`${storeBase}/history/` + idEntry), payload);
+          // Simpan TETAP boleh jalan walau ada field yang belum diisi — cukup diberi
+          // pemberitahuan field apa saja yang masih kosong (tidak menghalangi penyimpanan).
+          // Aturan "wajib diisi" hanya berlaku saat mengirim langsung ke Telegram/WA (lihat
+          // requestSendReport).
+          const stillEmpty = getEmptyReportFields();
+          if (stillEmpty.length > 0) {
+            showToast(`Laporan tersimpan! ⚠️ Masih ada ${stillEmpty.length} field kosong (lihat catatan kuning di atas tombol simpan).`);
+          } else {
+            showToast('Laporan berhasil disimpan di Cloud & HP! 📱✨');
+          }
+          // Update tampilan riwayat SEKETIKA, tidak nunggu listener realtime (yang bisa lambat
+          // di jaringan tertentu) — supaya tidak perlu refresh manual untuk melihat data baru.
+          setHistoryList(prev => {
+            const withoutOld = prev.filter(item => item.firebaseKey !== idEntry);
+            return [...withoutOld, { ...payload, firebaseKey: idEntry }].sort((a, b) => b.tanggal.localeCompare(a.tanggal));
+          });
+          
+          // Sync dengan Google Apps Script jika URL disediakan
+          if (config.googleAppScriptUrl) {
+            syncToGoogleSheets(payload);
+          }
+        } catch (error) {
+          console.error(error);
+          showToast('Gagal menyimpan ke Firebase. Cek koneksi Internet / Aturan Rules.');
+        }
+      };
+
+      const syncToGoogleSheets = async (dataPayload) => {
+        try {
+          await fetch(config.googleAppScriptUrl, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(dataPayload)
+          });
+          showToast('Sinkronisasi Google Sheets Berhasil! 🟢');
+        } catch (error) {
+          console.error(error);
+          showToast('Gagal terhubung ke Google Sheets.');
+        }
+      };
+
+      const handleLoadSampleData = () => {
+        setSalesData({
+          tanggal: '2026-05-29',
+          suhuFreezer: -18,
+          suhuChiller: 2,
+          soldBuns: {
+            original: 70,
+            coklat: 76,
+            vanilla: 84,
+            peach: 22,
+            lemon: 14,
+            raspberry: 21,
+            nanas: 18,
+            familyBox: 60
+          },
+          soldBeverages: {
+            taroLatte: 28,
+            chocolateIced: 0,
+            taroStrawberryCheese: 6,
+            taroBlueberry: 3
+          },
+          financials: {
+            value: 10315000,
+            cash: 0,
+            edc: 10315000,
+            grab: 850000,
+            shopeeFood: 420000,
+            goFood: 510000,
+            transaksi: 203
+          },
+          waste: {
+            fdNempel: 0,
+            bunRejectThawing: 0,
+            doughPecahProofing: 0,
+            doughGagalBaking: 35,
+            rotiMatang: 81
+          }
+        });
+
+        setInventoryData({
+          tanggal: '2026-05-29',
+          frozenDough: 1481,
+          toppingTaro: 83,
+          fillingCoklat: 31,
+          fillingVanilla: 29,
+          fillingLemon: 28,
+          fillingPeach: 28,
+          fillingRaspberry: 24,
+          fillingNanas: 20,
+          
+          uht: 6,
+          taroPowder: 4.8,
+          coklatPowder: 1,
+          whippingCream: 8,
+          ndcPowder: 8,
+          cheesePowder: 3,
+          strawberryKonsentrat: 4,
+          strawberrySyrup: 1,
+          blueberryKonsentrat: 3,
+
+          paperPouch: 2300,
+          familyPack: 194,
+          plastik20: 30,
+          plastik25: 20,
+          plastik35: 40,
+          cupbler22: 163,
+          cuplid22: 124,
+          cupTrayS: 75,
+          cupTrayM: 50,
+          glovesM: 0,
+          glovesL: 3,
+          glovesXL: 0,
+          trashBag: 3,
+          thermalPaper: 0,
+          kuraflexHijau: 3,
+          kuraflexPink: 3,
+          kitchenMask: 0,
+          tisuKecil: 12,
+          tisuBesar: 5
+        });
+        showToast('Data contoh 29 Mei 2026 berhasil dimuat! 🧁');
+      };
+
+      const generateReportString = (sales, inv) => {
+        const formattedDate = formatIndonesianDate(sales.tanggal);
+        const totalBuns = calculateTotalBunsSold(sales.soldBuns);
+        const totalBeverages = calculateTotalBeveragesSold(sales.soldBeverages);
+
+        // Ubah daftar field tambahan (buatan Admin lewat Form Builder) jadi baris teks "Label : nilai satuan",
+        // supaya ikut tercantum di laporan Telegram, bukan cuma tampil di form saja.
+        const formatCustomFieldLines = (fields, dataObj) => (fields || [])
+          .map(f => `${f.label} : ${(dataObj || {})[f.id] || 0}${f.unit ? ' ' + f.unit : ''}`)
+          .join('\n');
+        const customSalesLines = formatCustomFieldLines(customSalesFields, sales.custom);
+        const customDoughLines = formatCustomFieldLines(customInventoryFields.filter(f => f.section === 'dough'), inv.custom);
+        const customIngredientsLines = formatCustomFieldLines(customInventoryFields.filter(f => f.section === 'ingredients'), inv.custom);
+        const customPackagingLines = formatCustomFieldLines(customInventoryFields.filter(f => f.section === 'packaging'), inv.custom);
+        const customLainnyaLines = formatCustomFieldLines(customInventoryFields.filter(f => !f.section || f.section === 'lainnya'), inv.custom);
+
+        return `*LAPORAN PENJUALAN TAROBUN ${escapeTelegramMarkdown(storeName || '-').toUpperCase()}*
+Tanggal: ${formattedDate}
+
+Suhu freezer : ${sales.suhuFreezer || '-'}°
+Suhu chiller : ${sales.suhuChiller || '-'}°
+
+*Sold hari ini (pcs)* :
+Original : ${sales.soldBuns.original || 0} pcs
+Coklat : ${sales.soldBuns.coklat || 0} pcs
+Vanilla : ${sales.soldBuns.vanilla || 0} pcs
+Peach : ${sales.soldBuns.peach || 0} pcs
+Lemon : ${sales.soldBuns.lemon || 0} pcs
+Raspberry : ${sales.soldBuns.raspberry || 0} pcs
+Nanas : ${sales.soldBuns.nanas || 0} pcs
+Family box : ${sales.soldBuns.familyBox || 0} box (${numVal(sales.soldBuns.familyBox) * 6} pcs)
+*Total : ${totalBuns} pcs*
+
+*Beverage* :
+Taro latte : ${sales.soldBeverages.taroLatte || 0} cup
+Chocolate iced : ${sales.soldBeverages.chocolateIced || 0} cup
+Tarolatte strawberry cheese : ${sales.soldBeverages.taroStrawberryCheese || 0} cup
+Tarolatte blueberry : ${sales.soldBeverages.taroBlueberry || 0} cup
+*Total : ${totalBeverages} cup*
+
+*Financials & Transaksi* :
+Value : Rp. ${numVal(sales.financials.value).toLocaleString('id-ID')}
+Cash : Rp. ${numVal(sales.financials.cash).toLocaleString('id-ID')}
+EDC : Rp. ${numVal(sales.financials.edc).toLocaleString('id-ID')}
+Grab : Rp. ${numVal(sales.financials.grab).toLocaleString('id-ID')}
+ShopeeFood : Rp. ${numVal(sales.financials.shopeeFood).toLocaleString('id-ID')}
+GoFood : Rp. ${numVal(sales.financials.goFood).toLocaleString('id-ID')}
+Jumlah Transaksi : ${sales.financials.transaksi || 0}
+
+*Waste* :
+FD Nempel/Reject : ${sales.waste.fdNempel || '-'} pcs
+Bun Reject Thawing : ${sales.waste.bunRejectThawing || '-'} pcs
+Dough Pecah proofing : ${sales.waste.doughPecahProofing || '-'} pcs
+Dough gagal baking : ${sales.waste.doughGagalBaking || '-'} pcs
+Waste Bun : ${sales.waste.wasteBun || '-'} pcs
+Roti matang : ${sales.waste.rotiMatang || '-'} pcs
+${customSalesLines ? `\n*Data Tambahan Penjualan* :\n${customSalesLines}\n` : ''}
+------------------------------------------
+
+*STOK INVENTORY TAROBUN ${escapeTelegramMarkdown(storeName || '-').toUpperCase()}*
+
+*Frozen Dough & Fillings* :
+Frozen Dough : ${inv.frozenDough || 0} pcs
+Topping Taro : ${inv.toppingTaro || 0} pcs (${(numVal(inv.toppingTaro) * 0.5).toFixed(1)} kg)
+Filling Coklat : ${inv.fillingCoklat || 0} pcs (${(numVal(inv.fillingCoklat) * 0.5).toFixed(1)} kg)
+Filling Vanilla : ${inv.fillingVanilla || 0} pcs (${(numVal(inv.fillingVanilla) * 0.5).toFixed(1)} kg)
+Filling Lemon : ${inv.fillingLemon || 0} pcs (${(numVal(inv.fillingLemon) * 0.5).toFixed(1)} kg)
+Filling Peach : ${inv.fillingPeach || 0} pcs (${(numVal(inv.fillingPeach) * 0.5).toFixed(1)} kg)
+Filling Raspberry : ${inv.fillingRaspberry || 0} pcs (${(numVal(inv.fillingRaspberry) * 0.5).toFixed(1)} kg)
+Filling Nanas : ${inv.fillingNanas || 0} pcs (${(numVal(inv.fillingNanas) * 0.5).toFixed(1)} kg)${customDoughLines ? '\n' + customDoughLines : ''}
+
+*Ingredients & Powder* :
+UHT : ${inv.uht || 0} pcs
+Taro Powder : ${inv.taroPowder || 0} kg
+Coklat Powder : ${inv.coklatPowder || 0} pack
+Whipping Cream : ${inv.whippingCream || 0} pack
+NDC Powder : ${inv.ndcPowder || 0} pack
+Cheese Powder : ${inv.cheesePowder || 0} pack
+Strawberry Konsentrat : ${inv.strawberryKonsentrat || 0} kg
+Strawberry Flavoured Syrup : ${inv.strawberrySyrup || 0} botol
+Blueberry Konsentrat : ${inv.blueberryKonsentrat || 0} pack${customIngredientsLines ? '\n' + customIngredientsLines : ''}
+
+*Packaging & Operations* :
+Paper Pouch : ${inv.paperPouch || 0} pcs
+Familly Pack : ${inv.familyPack || 0} pcs
+Plastik UK 20 : ${inv.plastik20 || 0} pack
+Plastik UK 25 : ${inv.plastik25 || 0} pack
+Plastik UK 35 : ${inv.plastik35 || 0} pack
+Cupbler 22 Oz : ${inv.cupbler22 || 0} pcs
+Cuplid 22 Oz : ${inv.cuplid22 || 0} pcs
+Cup tray S : ${inv.cupTrayS || 0}
+Cup tray M : ${inv.cupTrayM || 0}
+Gloves M : ${inv.glovesM || 0} pack
+Gloves L : ${inv.glovesL || 0} pack
+Gloves XL : ${inv.glovesXL || 0} pack
+Trash Bag : ${inv.trashBag || 0} pack
+Thermal Paper : ${inv.thermalPaper || 0} pcs
+Kuraflex hijau : ${inv.kuraflexHijau || 0} pack
+Kuraflex pink : ${inv.kuraflexPink || 0} pack
+Kitchen Mask : ${inv.kitchenMask || 0} pack
+Tisu Kecil : ${inv.tisuKecil || 0} pack
+Tisu Besar : ${inv.tisuBesar || 0} pack${customPackagingLines ? '\n' + customPackagingLines : ''}
+${customLainnyaLines ? `\n*Data Tambahan* :\n${customLainnyaLines}\n` : ''}
+Terima Kasih 🙏🏻`;
+      };
+
+      const handleCopyToClipboard = (text) => {
+        const tempTextArea = document.createElement('textarea');
+        tempTextArea.value = text;
+        document.body.appendChild(tempTextArea);
+        tempTextArea.select();
+        try {
+          document.execCommand('copy');
+          showToast('Laporan berhasil disalin ke clipboard! 📋');
+        } catch (err) {
+          showToast('Gagal menyalin otomatis.');
+        }
+        document.body.removeChild(tempTextArea);
+      };
+
+      const handleSendToWA = (salesOverride, invOverride) => {
+        const text = generateReportString(salesOverride || salesData, invOverride || inventoryData);
+        const encodedText = encodeURIComponent(text);
+        window.open(`https://api.whatsapp.com/send?text=${encodedText}`, '_blank');
+      };
+
+      const handleSendToTelegram = async (salesOverride, invOverride) => {
+        if (!config.telegramBotToken || !config.telegramChatId) {
+          showToast('⚠️ Isi Bot Token dan Chat ID Telegram Anda di menu pengaturan (Roda Gigi) dahulu!');
+          setShowConfig(true);
+          return;
+        }
+
+        const reportMessage = generateReportString(salesOverride || salesData, invOverride || inventoryData);
+        showToast('Mengirim ke Telegram... ✈️');
+        const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, reportMessage);
+        if (res.ok) {
+          showToast('Laporan berhasil dikirim ke Telegram! 🚀');
+        } else {
+          // Pesan error sekarang spesifik (bukan generik) & detailnya sudah dicatat ke console
+          // oleh sendTelegramMessage, sehingga penyebab gagal selalu bisa ditelusuri.
+          showToast(`Gagal mengirim laporan: ${res.error}`);
+        }
+      };
+
+      // ==========================================
+      // GERBANG VALIDASI SEBELUM KIRIM (Telegram/WA) — field kosong WAJIB diisi dulu.
+      // Kalau memang sengaja kosong, tawarkan isi otomatis dengan 0 (lewat modal konfirmasi)
+      // baru lanjut kirim. "Simpan di Cloud" TIDAK lewat gerbang ini (lihat handleSaveToDevice).
+      // ==========================================
+      const requestSendReport = (action) => {
+        const empty = getEmptyReportFields();
+        if (empty.length === 0) {
+          if (action === 'telegram') handleSendToTelegram();
+          else handleSendToWA();
+          return;
+        }
+        setEmptyFieldsForModal(empty);
+        setPendingSendAction(action);
+        setShowEmptyFieldsSendModal(true);
+      };
+
+      const handleConfirmFillZeroAndSend = () => {
+        const { newSales, newInv } = fillEmptyReportFieldsWithZero(emptyFieldsForModal);
+        setSalesData(newSales);
+        setInventoryData(newInv);
+        setShowEmptyFieldsSendModal(false);
+        if (pendingSendAction === 'telegram') handleSendToTelegram(newSales, newInv);
+        else if (pendingSendAction === 'wa') handleSendToWA(newSales, newInv);
+        setPendingSendAction(null);
+        setEmptyFieldsForModal([]);
+      };
+
+      // --- PROSES DELETION PADA FIREBASE ---
+      const handleDeleteHistory = async (id) => {
+        try {
+          showToast('Menghapus dari Cloud... 🗑️');
+          await restRemove(db.ref(`${storeBase}/history/` + id));
+          showToast('Riwayat berhasil dihapus dari Cloud.');
+          setHistoryList(prev => prev.filter(item => item.firebaseKey !== id));
+        } catch (error) {
+          showToast('Gagal menghapus data.');
+        }
+      };
+
+      // ==========================================
+      // DATANG BARANG - LOGIKA
+      // ==========================================
+      const handleKedatanganItemChange = (key, value) => {
+        setKedatanganForm(prev => ({
+          ...prev,
+          items: { ...prev.items, [key]: value }
+        }));
+      };
+
+      // Khusus item Kop Khusus (Frozen Dough, Topping Taro, Filling): nilai berupa { jumlah, tanggalProduksi }
+      const handleKedatanganKhususChange = (key, field, value) => {
+        setKedatanganForm(prev => {
+          const current = prev.items[key] && typeof prev.items[key] === 'object' ? prev.items[key] : { jumlah: '', tanggalProduksi: '' };
+          return {
+            ...prev,
+            items: {
+              ...prev.items,
+              [key]: { ...current, [field]: value }
+            }
+          };
+        });
+      };
+
+      // Helper ambil jumlah & tanggal produksi item khusus dengan aman (jaga kompatibilitas data lama yang masih string)
+      const getKhususItemValue = (items, key) => {
+        const val = items[key];
+        if (val && typeof val === 'object') return val;
+        return { jumlah: val || '', tanggalProduksi: '' };
+      };
+
+      const handleAddTidakSesuai = () => {
+        if (!tidakSesuaiInput.nama || !tidakSesuaiInput.jumlah) {
+          showToast('⚠️ Isi nama barang & jumlah pada Barang Tidak Sesuai Surat.');
+          return;
+        }
+        setKedatanganForm(prev => ({
+          ...prev,
+          tidakSesuai: [
+            ...prev.tidakSesuai,
+            {
+              id: Date.now().toString(),
+              nama: tidakSesuaiInput.nama,
+              jumlah: tidakSesuaiInput.jumlah,
+              satuan: tidakSesuaiInput.satuan,
+              keterangan: tidakSesuaiInput.keterangan
+            }
+          ]
+        }));
+        setTidakSesuaiInput({ nama: '', jumlah: '', satuan: 'pcs', keterangan: '' });
+        showToast('Barang tidak sesuai ditambahkan ke daftar. ✅');
+      };
+
+      const handleRemoveTidakSesuai = (id) => {
+        setKedatanganForm(prev => ({
+          ...prev,
+          tidakSesuai: prev.tidakSesuai.filter(it => it.id !== id)
+        }));
+      };
+
+      const handleResetKedatanganForm = () => {
+        setKedatanganForm(getEmptyKedatanganForm());
+        setTidakSesuaiInput({ nama: '', jumlah: '', satuan: 'pcs', keterangan: '' });
+      };
+
+      const generateKedatanganReportString = (form) => {
+        const formattedDate = formatIndonesianDate(form.tanggal);
+        let text = `*Selamat Pagi Pak/Bu. Menginformasikan ${escapeTelegramMarkdown(storeName || '-')} Kedatangan Barang*\nTanggal: ${formattedDate}\n`;
+        if (form.noSuratJalan) {
+          text += `No. Faktur/Surat Jalan: ${form.noSuratJalan}\n`;
+        }
+        text += `\n*Frozen Dough & Filling (Kop Khusus)* :\n`;
+        let anyKhusus = false;
+        KEDATANGAN_KOP_KHUSUS_ITEMS.forEach(item => {
+          const val = getKhususItemValue(form.items, item.key);
+          if (val.jumlah && numVal(val.jumlah) > 0) {
+            anyKhusus = true;
+            const tgl = val.tanggalProduksi ? ` (Produksi: ${val.tanggalProduksi})` : '';
+            text += `${item.label} : ${val.jumlah} ${item.unit}${tgl}\n`;
+          }
+        });
+        if (!anyKhusus) text += `(Tidak ada input)\n`;
+
+        text += `\n*Barang Umum* :\n`;
+        let anyUmum = false;
+        KEDATANGAN_BARANG_UMUM_ITEMS.forEach(item => {
+          const val = form.items[item.key];
+          if (val && numVal(val) > 0) {
+            anyUmum = true;
+            text += `${item.label} : ${val} ${item.unit}\n`;
+          }
+        });
+        if (!anyUmum) text += `(Tidak ada input)\n`;
+
+        if (form.tidakSesuai && form.tidakSesuai.length > 0) {
+          text += `\n*Barang Tidak Sesuai Faktur/Surat Jalan* :\n`;
+          form.tidakSesuai.forEach(it => {
+            text += `${it.nama} : ${it.jumlah} ${it.satuan}${it.keterangan ? ' - ' + it.keterangan : ''}\n`;
+          });
+        }
+
+        text += `\nAccurate done✅
+Ordering tracker done✅
+Daily inventory done✅
+        Terima kasih 🙏🏻`;
+        return text;
+      };
+
+      const handleSaveKedatangan = async () => {
+        const hasKhusus = KEDATANGAN_KOP_KHUSUS_ITEMS.some(item => numVal(getKhususItemValue(kedatanganForm.items, item.key).jumlah) > 0);
+        const hasUmum = KEDATANGAN_BARANG_UMUM_ITEMS.some(item => numVal(kedatanganForm.items[item.key]) > 0);
+        const hasTidakSesuai = kedatanganForm.tidakSesuai && kedatanganForm.tidakSesuai.length > 0;
+
+        if (!hasKhusus && !hasUmum && !hasTidakSesuai) {
+          showToast('⚠️ Isi minimal satu jumlah barang sebelum menyimpan.');
+          return;
+        }
+
+        // VALIDASI FIELD WAJIB (perbaikan bug): teks di form sudah menyatakan "Frozen Dough s.d.
+        // Filling wajib pakai No. Faktur/Surat Jalan", tapi sebelumnya tidak ada pengecekan apa pun
+        // di kode — sehingga data Kop Khusus bisa "tersimpan" tanpa No. Faktur/Surat Jalan, membuat
+        // laporan tidak bisa ditelusuri asal suratnya. Sekarang benar-benar ditegakkan di sini.
+        if (hasKhusus && !kedatanganForm.noSuratJalan.trim()) {
+          showToast('⚠️ No. Faktur/Surat Jalan wajib diisi untuk item Frozen Dough s.d. Filling (Kop Khusus).');
+          return;
+        }
+        if (!kedatanganForm.tanggal) {
+          showToast('⚠️ Tanggal kedatangan wajib diisi.');
+          return;
+        }
+
+        setIsSavingKedatangan(true);
+        try {
+          const now = Date.now();
+          // Bersihkan & KONVERSI TIPE DATA items: input HTML selalu mengirim string
+          // (e.target.value), padahal field ini seharusnya numerik. Sebelumnya nilai string
+          // mentah ("5", "", "abc") langsung disimpan apa adanya ke database tanpa konversi
+          // maupun validasi, sehingga tipe data tidak konsisten antar-entri dan bisa membuat
+          // penjumlahan/laporan di tempat lain salah hitung atau gagal. Di sini setiap nilai
+          // dipastikan berupa Number yang valid (>0) sebelum disimpan; nilai kosong/0/tidak
+          // valid tidak ikut disimpan sama sekali.
+          const safeItems = {};
+          Object.keys(kedatanganForm.items || {}).forEach((k) => {
+            const v = kedatanganForm.items[k];
+            if (v === undefined || v === null) return;
+            if (v && typeof v === 'object') {
+              // Item Kop Khusus: { jumlah, tanggalProduksi }
+              const jumlahNum = numVal(v.jumlah);
+              if (jumlahNum > 0) {
+                safeItems[k] = { jumlah: jumlahNum, tanggalProduksi: String(v.tanggalProduksi || '').trim() };
+              }
+            } else {
+              const jumlahNum = numVal(v);
+              if (jumlahNum > 0) safeItems[k] = jumlahNum;
+            }
+          });
+
+          if (Object.keys(safeItems).length === 0 && !hasTidakSesuai) {
+            showToast('⚠️ Jumlah barang tidak valid. Isi angka lebih dari 0.');
+            setIsSavingKedatangan(false);
+            return;
+          }
+
+          const payload = {
+            id: now.toString(),
+            tanggal: kedatanganForm.tanggal,
+            noSuratJalan: (kedatanganForm.noSuratJalan || '').trim(),
+            items: safeItems,
+            tidakSesuai: Array.isArray(kedatanganForm.tidakSesuai) ? [...kedatanganForm.tidakSesuai] : [],
+            createdAt: now
+          };
+          await restSet(db.ref(`${storeBase}/kedatanganBarang/` + now), payload);
+          showToast('Data kedatangan barang tersimpan ke Riwayat! 📦✨');
+          // Update optimis ke daftar riwayat lokal, cegah duplikat kalau listener realtime
+          // Firebase kebetulan sudah lebih dulu menerima data yang sama persis.
+          setKedatanganHistoryList(prev => {
+            const withoutDup = prev.filter(it => it.firebaseKey !== now.toString());
+            return [...withoutDup, { ...payload, firebaseKey: now.toString() }].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          });
+          handleResetKedatanganForm();
+        } catch (error) {
+          // Log detail penyebab ke console (bukan cuma pesan generik) supaya mudah didiagnosis:
+          // mis. HTTP 401/403 (sesi kedaluwarsa), HTTP 5xx (Worker error), atau TypeError (jaringan putus).
+          console.error('Gagal menyimpan data kedatangan barang. Detail:', error);
+          const reason = (error && error.message) ? error.message : 'periksa koneksi internet Anda';
+          showToast(`Gagal menyimpan data: ${reason}. Data belum tersimpan, silakan coba lagi.`);
+        } finally {
+          setIsSavingKedatangan(false);
+        }
+      };
+
+      const handleDeleteKedatangan = async (firebaseKey) => {
+        try {
+          showToast('Menghapus data... 🗑️');
+          await restRemove(db.ref(`${storeBase}/kedatanganBarang/` + firebaseKey));
+          showToast('Data kedatangan barang berhasil dihapus.');
+          setKedatanganHistoryList(prev => prev.filter(item => item.firebaseKey !== firebaseKey));
+        } catch (error) {
+          showToast('Gagal menghapus data.');
+        }
+      };
+
+      const handleSendKedatanganToTelegram = async (form) => {
+        if (!config.telegramBotToken || !config.telegramChatId) {
+          showToast('⚠️ Isi Bot Token & Chat ID Telegram di menu pengaturan (Roda Gigi) dahulu!');
+          setShowConfig(true);
+          return;
+        }
+        const text = generateKedatanganReportString(form);
+        showToast('Mengirim ke Telegram... ✈️');
+        const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, text);
+        if (res.ok) {
+          showToast('Laporan kedatangan barang terkirim ke Telegram! 🚀');
+        } else {
+          showToast(`Gagal mengirim laporan: ${res.error}`);
+        }
+      };
+
+      const loadKedatanganToActive = (item) => {
+        setKedatanganForm({
+          tanggal: item.tanggal,
+          noSuratJalan: item.noSuratJalan || '',
+          items: { ...item.items },
+          tidakSesuai: item.tidakSesuai ? [...item.tidakSesuai] : []
+        });
+        setActiveTab('kedatangan');
+        showToast(`Memuat data kedatangan tanggal: ${item.tanggal} 🔄`);
+      };
+
+      // ==========================================
+      // BAP (LAPORAN SELISIH TRANSAKSI) - LOGIKA
+      // ==========================================
+
+      // Selisih selalu ditampilkan sebagai nilai mutlak (bukan negatif), mengikuti contoh format
+      // yang diminta: "(Selisih Rp. 200)" — bukan "-200" atau "200-".
+      const bapSelisih = Math.abs(numVal(bapForm.nominalPos) - numVal(bapForm.nominalChannel));
+
+      // Kalimat keterangan otomatis, hanya dipakai untuk MENGISI kolom keterangan selama
+      // user belum mengetik sendiri (lihat bapKeteranganAuto). User tetap bebas mengedit atau
+      // mengganti total teksnya kapan saja.
+      const buildAutoBapKeterangan = (selisih) => selisih > 0
+        ? `Selisih Rp. ${selisih.toLocaleString('id-ID')} dikarenakan sistem pada POS.`
+        : '';
+
+      // Setiap nominal POS/Channel berubah, keterangan ikut menyesuaikan otomatis — TAPI hanya
+      // selama bapKeteranganAuto masih true (user belum pernah mengetik manual di kolom itu).
+      useEffect(() => {
+        if (!bapKeteranganAuto) return;
+        setBapForm(prev => ({ ...prev, keterangan: buildAutoBapKeterangan(bapSelisih) }));
+      }, [bapForm.nominalPos, bapForm.nominalChannel, bapKeteranganAuto]);
+
+      const handleBapKeteranganChange = (value) => {
+        setBapKeteranganAuto(false); // user mulai mengetik manual, hentikan auto-update
+        setBapForm(prev => ({ ...prev, keterangan: value }));
+      };
+
+      const handleResetBapKeteranganOtomatis = () => {
+        setBapKeteranganAuto(true);
+        setBapForm(prev => ({ ...prev, keterangan: buildAutoBapKeterangan(bapSelisih) }));
+      };
+
+      const generateBapReportString = (form) => {
+        const formattedDate = formatIndonesianDate(form.tanggal);
+        const selisih = Math.abs(numVal(form.nominalPos) - numVal(form.nominalChannel));
+        let text = `*${escapeTelegramMarkdown(storeName || '-')}*\nTanggal: ${formattedDate}\n\n`;
+        text += `Transaksi: ${form.transaksi}\n`;
+        text += `Nominal POS: Rp. ${numVal(form.nominalPos).toLocaleString('id-ID')}\n`;
+        text += `Nominal ${form.transaksi}: Rp. ${numVal(form.nominalChannel).toLocaleString('id-ID')}\n`;
+        text += `(Selisih Rp. ${selisih.toLocaleString('id-ID')})\n`;
+        if (form.keterangan && form.keterangan.trim()) {
+          text += `Keterangan: ${form.keterangan.trim()}\n`;
+        }
+        text += `\nTerimakasih 🙏`;
+        return text;
+      };
+
+      const handleResetBapForm = () => {
+        setBapForm(getEmptyBapForm());
+        setBapKeteranganAuto(true);
+      };
+
+      const handleSaveBap = async () => {
+        if (!bapForm.tanggal) {
+          showToast('⚠️ Tanggal wajib diisi.');
+          return;
+        }
+        if (numVal(bapForm.nominalPos) <= 0 && numVal(bapForm.nominalChannel) <= 0) {
+          showToast('⚠️ Isi minimal salah satu nominal (POS atau channel) sebelum menyimpan.');
+          return;
+        }
+        setIsSavingBap(true);
+        try {
+          const now = Date.now();
+          const payload = {
+            id: now.toString(),
+            tanggal: bapForm.tanggal,
+            transaksi: bapForm.transaksi,
+            nominalPos: numVal(bapForm.nominalPos),
+            nominalChannel: numVal(bapForm.nominalChannel),
+            selisih: Math.abs(numVal(bapForm.nominalPos) - numVal(bapForm.nominalChannel)),
+            keterangan: (bapForm.keterangan || '').trim(),
+            createdAt: now,
+          };
+          await restSet(db.ref(`${storeBase}/bapReports/` + now), payload);
+          showToast('Laporan BAP tersimpan ke Riwayat! 📋✨');
+          setBapHistoryList(prev => {
+            const withoutDup = prev.filter(it => it.firebaseKey !== now.toString());
+            return [...withoutDup, { ...payload, firebaseKey: now.toString() }].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          });
+          handleResetBapForm();
+        } catch (error) {
+          console.error('Gagal menyimpan laporan BAP. Detail:', error);
+          const reason = (error && error.message) ? error.message : 'periksa koneksi internet Anda';
+          showToast(`Gagal menyimpan data: ${reason}. Data belum tersimpan, silakan coba lagi.`);
+        } finally {
+          setIsSavingBap(false);
+        }
+      };
+
+      const handleDeleteBap = async (firebaseKey) => {
+        try {
+          showToast('Menghapus laporan BAP... 🗑️');
+          await restRemove(db.ref(`${storeBase}/bapReports/` + firebaseKey));
+          showToast('Laporan BAP berhasil dihapus.');
+          setBapHistoryList(prev => prev.filter(item => item.firebaseKey !== firebaseKey));
+        } catch (error) {
+          showToast('Gagal menghapus laporan BAP.');
+        }
+      };
+
+      const handleSendBapToTelegram = async (form) => {
+        if (!config.telegramBotToken || !config.telegramChatId) {
+          showToast('⚠️ Isi Bot Token & Chat ID Telegram di menu pengaturan (Roda Gigi) dahulu!');
+          setShowConfig(true);
+          return;
+        }
+        const text = generateBapReportString(form);
+        showToast('Mengirim laporan BAP ke Telegram... ✈️');
+        const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, text);
+        if (res.ok) {
+          showToast('Laporan BAP terkirim ke Telegram! 🚀');
+        } else {
+          showToast(`Gagal mengirim laporan: ${res.error}`);
+        }
+      };
+
+      const loadBapToActive = (item) => {
+        setBapForm({
+          tanggal: item.tanggal,
+          transaksi: item.transaksi,
+          nominalPos: item.nominalPos,
+          nominalChannel: item.nominalChannel,
+          keterangan: item.keterangan || '',
+        });
+        setBapKeteranganAuto(false); // data lama dianggap sudah final, jangan ditimpa auto-text
+        setActiveTab('bap');
+        showToast(`Memuat data BAP tanggal: ${item.tanggal} 🔄`);
+      };
+
+      // ==========================================
+      // FOTO WASTE / RIJEK - LOGIKA
+      // ==========================================
+
+      // Baca tag orientasi EXIF dari JPEG (fallback untuk browser yang tidak mendukung
+      // opsi imageOrientation pada createImageBitmap, mis. Safari lama). Mengembalikan 1-8
+      // sesuai standar EXIF, atau 1 (normal) jika tidak ditemukan/bukan JPEG.
+      const getExifOrientation = (file) => {
+        return new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onerror = () => resolve(1);
+          reader.onload = (e) => {
+            try {
+              const view = new DataView(e.target.result);
+              if (view.getUint16(0, false) !== 0xFFD8) { resolve(1); return; }
+              const length = view.byteLength;
+              let offset = 2;
+              while (offset < length) {
+                const marker = view.getUint16(offset, false);
+                offset += 2;
+                if (marker === 0xFFE1) {
+                  if (view.getUint32(offset + 2, false) !== 0x45786966) { resolve(1); return; }
+                  const little = view.getUint16(offset + 8, false) === 0x4949;
+                  const tiffOffset = offset + 8;
+                  const firstIFDOffset = view.getUint32(tiffOffset + 4, little);
+                  const dirOffset = tiffOffset + firstIFDOffset;
+                  const tagCount = view.getUint16(dirOffset, little);
+                  for (let i = 0; i < tagCount; i++) {
+                    const entryOffset = dirOffset + 2 + i * 12;
+                    if (view.getUint16(entryOffset, little) === 0x0112) {
+                      resolve(view.getUint16(entryOffset + 8, little));
+                      return;
+                    }
+                  }
+                  resolve(1); return;
+                } else if ((marker & 0xFF00) !== 0xFF00) {
+                  break;
+                } else {
+                  offset += view.getUint16(offset, false);
+                }
+              }
+              resolve(1);
+            } catch (err) { resolve(1); }
+          };
+          // Cukup baca 128KB pertama, EXIF selalu ada di awal file
+          reader.readAsArrayBuffer(file.slice(0, 131072));
+        });
+      };
+
+      // Muat file gambar menjadi source yang siap digambar ke canvas dengan orientasi yang SUDAH
+      // benar. Ini memperbaiki foto dari kamera HP yang sering tampil miring/terbalik saat
+      // disimpan atau dikirim ke Telegram, karena canvas secara default mengabaikan EXIF.
+      const loadOrientedImageSource = async (file) => {
+        // Jalur cepat & ringan: browser modern otomatis mengoreksi rotasi EXIF saat decode
+        if (window.createImageBitmap) {
+          try {
+            const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+            return { source: bitmap, width: bitmap.width, height: bitmap.height, orientation: 1, isBitmap: true };
+          } catch (err) {
+            // Beberapa browser lama tidak mendukung opsi ini -> lanjut ke fallback di bawah
+          }
+        }
+        const orientation = await getExifOrientation(file).catch(() => 1);
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(new Error('Gagal membaca file'));
+          reader.onload = (e) => resolve(e.target.result);
+          reader.readAsDataURL(file);
+        });
+        const img = await new Promise((resolve, reject) => {
+          const el = new Image();
+          el.onload = () => resolve(el);
+          el.onerror = () => reject(new Error('Gagal memuat gambar. Pastikan formatnya JPG/PNG.'));
+          el.src = dataUrl;
+        });
+        return { source: img, width: img.width, height: img.height, orientation, isBitmap: false };
+      };
+
+      // Kompres foto di sisi klien (resize + JPEG quality + koreksi orientasi EXIF) agar ringan,
+      // tampil tegak lurus, dan aman untuk penyimpanan Firebase maupun dikirim ke Telegram.
+      // Dipakai bersama oleh Foto Rijek/Waste dan fitur unggah foto lainnya.
+      const compressImageFile = async (file, maxWidth = 800, quality = 0.6) => {
+        if (!file) throw new Error('Tidak ada file');
+        const { source, width: srcW, height: srcH, orientation, isBitmap } = await loadOrientedImageSource(file);
+
+        // Langkah 1: perbaiki orientasi ke canvas sementara berukuran asli (belum di-resize)
+        const swapDims = !isBitmap && orientation >= 5 && orientation <= 8;
+        const natW = swapDims ? srcH : srcW;
+        const natH = swapDims ? srcW : srcH;
+
+        const oriented = document.createElement('canvas');
+        oriented.width = natW;
+        oriented.height = natH;
+        const octx = oriented.getContext('2d');
+        if (!isBitmap && orientation && orientation !== 1) {
+          octx.save();
+          switch (orientation) {
+            case 2: octx.transform(-1, 0, 0, 1, natW, 0); break;
+            case 3: octx.transform(-1, 0, 0, -1, natW, natH); break;
+            case 4: octx.transform(1, 0, 0, -1, 0, natH); break;
+            case 5: octx.transform(0, 1, 1, 0, 0, 0); break;
+            case 6: octx.transform(0, 1, -1, 0, natH, 0); break;
+            case 7: octx.transform(0, -1, -1, 0, natH, natW); break;
+            case 8: octx.transform(0, -1, 1, 0, 0, natW); break;
+            default: break;
+          }
+          octx.drawImage(source, 0, 0, srcW, srcH);
+          octx.restore();
+        } else {
+          octx.drawImage(source, 0, 0, natW, natH);
+        }
+        if (isBitmap && source.close) source.close();
+
+        // Langkah 2: resize ke lebar target + kompres kualitas JPEG agar ringan
+        let width = natW;
+        let height = natH;
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, width, height);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(oriented, 0, 0, width, height);
+        // Hasil base64 JPEG terkompresi, sudah tegak lurus & ringan
+        return canvas.toDataURL('image/jpeg', quality);
+      };
+
+      // ==========================================
+      // STEMPEL KETERANGAN & JAM DI DALAM FOTO WASTE/RIJEK (2026-08-06)
+      // ==========================================
+      // Menggambar bar semi-transparan di bagian bawah foto berisi kategori, jumlah,
+      // keterangan, dan tanggal+jam pengiriman — LANGSUNG di dalam gambar (bukan cuma teks
+      // caption terpisah), supaya tetap terbaca walau foto di-screenshot/di-forward/diunduh
+      // terpisah dari pesan Telegram-nya.
+      const stampWasteFotoImage = (dataUrl, lines) => new Promise((resolve, reject) => {
+        try {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+
+            const fontSize = Math.max(13, Math.round(canvas.width * 0.038));
+            const lineGap = Math.round(fontSize * 0.35);
+            const padding = Math.round(fontSize * 0.7);
+            const barHeight = padding * 2 + (lines.length * fontSize) + ((lines.length - 1) * lineGap);
+
+            // Bar gradasi gelap dari transparan ke hitam pekat di bagian paling bawah, supaya
+            // teks putih selalu terbaca jelas di atas foto apapun warnanya.
+            const grad = ctx.createLinearGradient(0, canvas.height - barHeight - 20, 0, canvas.height);
+            grad.addColorStop(0, 'rgba(0,0,0,0)');
+            grad.addColorStop(1, 'rgba(0,0,0,0.72)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, canvas.height - barHeight - 20, canvas.width, barHeight + 20);
+
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+            ctx.textBaseline = 'top';
+            ctx.shadowColor = 'rgba(0,0,0,0.6)';
+            ctx.shadowBlur = 3;
+            let y = canvas.height - barHeight + padding - Math.round(padding * 0.3);
+            lines.forEach(line => {
+              ctx.fillText(line, padding, y, canvas.width - padding * 2);
+              y += fontSize + lineGap;
+            });
+
+            resolve(canvas.toDataURL('image/jpeg', 0.85));
+          };
+          img.onerror = () => reject(new Error('Gagal memuat gambar untuk distempel'));
+          img.src = dataUrl;
+        } catch (e) {
+          reject(e);
+        }
+      });
+
+      // Susun baris teks stempel dari data form foto waste/rijek: kategori+jumlah, keterangan,
+      // lalu tanggal & jam saat foto ini disimpan/dikirim (bukan jam pengambilan foto, supaya
+      // selalu mencerminkan waktu laporan resmi dibuat).
+      const buildWasteFotoStampLines = (kategoriKey, jumlah, keterangan) => {
+        const catInfo = WASTE_CATEGORIES[kategoriKey] || WASTE_CATEGORIES.bunRijek;
+        const now = new Date();
+        const tanggalJam = now.toLocaleString('id-ID', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' WIB';
+        const lines = [`${catInfo.label} • ${numVal(jumlah)} pcs`];
+        if (keterangan && keterangan.trim()) lines.push(keterangan.trim().slice(0, 80));
+        lines.push(tanggalJam);
+        return lines;
+      };
+
+      // Estimasi ukuran base64 dalam KB (untuk validasi ringan sebelum simpan)
+      const estimateBase64SizeKB = (base64Str) => {
+        if (!base64Str) return 0;
+        const base = base64Str.split(',')[1] || '';
+        return Math.round((base.length * 3) / 4 / 1024);
+      };
+
+      const handleWasteFotoFileChange = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        if (!file.type.startsWith('image/')) {
+          showToast('⚠️ File harus berupa foto/gambar.');
+          e.target.value = '';
+          return;
+        }
+        // Guard awal: file mentah super besar (mis. hasil kamera 48MP) bisa bikin HP nge-lag
+        // saat diproses, terutama di browser lama tanpa createImageBitmap.
+        if (file.size > 25 * 1024 * 1024) {
+          showToast('⚠️ Ukuran foto terlalu besar (maks 25MB). Coba ambil ulang atau pilih foto lain.');
+          e.target.value = '';
+          return;
+        }
+        setIsCompressingFoto(true);
+        try {
+          // Coba beberapa tingkat kompresi berturut-turut, berhenti begitu ukurannya sudah
+          // cukup ringan agar hemat proses & tetap lancar saat nanti dikirim ke Telegram.
+          const steps = [
+            { maxWidth: 900, quality: 0.65 },
+            { maxWidth: 700, quality: 0.5 },
+            { maxWidth: 550, quality: 0.4 },
+            { maxWidth: 400, quality: 0.35 },
+          ];
+          let compressed = null;
+          let sizeKB = Infinity;
+          for (const step of steps) {
+            compressed = await compressImageFile(file, step.maxWidth, step.quality);
+            sizeKB = estimateBase64SizeKB(compressed);
+            if (sizeKB <= 300) break; // sudah cukup ringan, tidak perlu kompres lebih jauh
+          }
+          if (sizeKB > 600) {
+            showToast('⚠️ Foto terlalu besar walau sudah dikompres, coba foto lain.');
+            return;
+          }
+          setWasteFotoForm(prev => ({ ...prev, fotoPreview: compressed }));
+          showToast(`Foto siap (≈${sizeKB} KB setelah kompresi) 📸`);
+        } catch (error) {
+          console.error(error);
+          showToast('Gagal memproses foto. Pastikan formatnya JPG/PNG lalu coba lagi.');
+        } finally {
+          setIsCompressingFoto(false);
+          // reset value supaya input file yang sama bisa dipilih ulang
+          e.target.value = '';
+        }
+      };
+
+      const handleResetWasteFotoForm = (keepCategory = true) => {
+        setWasteFotoForm(prev => ({
+          kategori: keepCategory ? prev.kategori : 'bunRijek',
+          jumlah: '',
+          keterangan: '',
+          fotoPreview: null
+        }));
+      };
+
+      const handleSaveWasteFoto = async () => {
+        if (!wasteFotoForm.fotoPreview) {
+          showToast('⚠️ Ambil atau pilih foto terlebih dahulu.');
+          return;
+        }
+        if (!wasteFotoForm.jumlah || numVal(wasteFotoForm.jumlah) <= 0) {
+          showToast('⚠️ Isi jumlah terlebih dahulu.');
+          return;
+        }
+        setIsSavingFoto(true);
+        try {
+          const now = Date.now();
+          // Stempel keterangan, jumlah, kategori & jam LANGSUNG di dalam foto sebelum diupload,
+          // supaya info itu tetap ikut terlihat di foto itu sendiri (bukan cuma teks caption
+          // terpisah saat dikirim ke Telegram) — lihat stampWasteFotoImage di atas.
+          const stampedFoto = await stampWasteFotoImage(
+            wasteFotoForm.fotoPreview,
+            buildWasteFotoStampLines(wasteFotoForm.kategori, wasteFotoForm.jumlah, wasteFotoForm.keterangan)
+          );
+          // Upload dulu ke R2 — database cuma menyimpan URL & key-nya, bukan base64 mentah,
+          // supaya storage tetap ringan (lihat juga fitur hapus laporan di Panel Admin).
+          const { url: fotoUrl, key: fotoKey } = await uploadMediaToR2(stampedFoto, `wasteFotos/${storeBase}`, 'jpg');
+          const payload = {
+            id: now.toString(),
+            kategori: wasteFotoForm.kategori,
+            jumlah: numVal(wasteFotoForm.jumlah),
+            keterangan: wasteFotoForm.keterangan || '',
+            foto: fotoUrl,
+            fotoKey: fotoKey,
+            tanggal: new Date(now).toISOString().split('T')[0],
+            createdAt: now
+          };
+          await restSet(db.ref(`${storeBase}/wasteFotos/` + now), payload);
+          showToast('Foto tersimpan ke Riwayat! Silakan input foto baru lagi 📷✨');
+          setWasteFotoList(prev => [...prev, { ...payload, firebaseKey: now.toString() }].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
+          setWasteFotoViewDate(payload.tanggal);
+          handleResetWasteFotoForm(true);
+        } catch (error) {
+          console.error(error);
+          showToast('Gagal menyimpan foto ke Cloud. Cek koneksi internet.');
+        } finally {
+          setIsSavingFoto(false);
+        }
+      };
+
+      const handleDeleteWasteFoto = async (firebaseKey) => {
+        try {
+          showToast('Menghapus foto... 🗑️');
+          await restRemove(db.ref(`${storeBase}/wasteFotos/` + firebaseKey));
+          showToast('Foto berhasil dihapus dari Riwayat.');
+          setWasteFotoList(prev => prev.filter(item => item.firebaseKey !== firebaseKey));
+        } catch (error) {
+          console.error('Gagal menghapus foto waste:', error);
+          const detail = (error && error.message) ? error.message : 'Kesalahan tidak diketahui';
+          showToast(`⚠️ Gagal menghapus foto: ${detail}`);
+        }
+      };
+
+      // ==========================================
+      // PRE ORDER PESANAN — upload bukti bayar, simpan, & kirim ke grup Telegram (2026-07-20)
+      // ==========================================
+      const handleBuktiFotoFileChange = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        if (!file.type.startsWith('image/')) {
+          showToast('⚠️ File harus berupa foto/gambar.');
+          e.target.value = '';
+          return;
+        }
+        if (file.size > 25 * 1024 * 1024) {
+          showToast('⚠️ Ukuran foto terlalu besar (maks 25MB). Coba ambil ulang atau pilih foto lain.');
+          e.target.value = '';
+          return;
+        }
+        setIsCompressingBukti(true);
+        try {
+          const steps = [
+            { maxWidth: 900, quality: 0.65 },
+            { maxWidth: 700, quality: 0.5 },
+            { maxWidth: 550, quality: 0.4 },
+            { maxWidth: 400, quality: 0.35 },
+          ];
+          let compressed = null;
+          let sizeKB = Infinity;
+          for (const step of steps) {
+            compressed = await compressImageFile(file, step.maxWidth, step.quality);
+            sizeKB = estimateBase64SizeKB(compressed);
+            if (sizeKB <= 300) break;
+          }
+          if (sizeKB > 600) {
+            showToast('⚠️ Foto terlalu besar walau sudah dikompres, coba foto lain.');
+            return;
+          }
+          setPreOrderForm(prev => ({ ...prev, buktiPreview: compressed }));
+          showToast(`Foto bukti siap (≈${sizeKB} KB setelah kompresi) 📸`);
+        } catch (error) {
+          console.error(error);
+          showToast('Gagal memproses foto. Pastikan formatnya JPG/PNG lalu coba lagi.');
+        } finally {
+          setIsCompressingBukti(false);
+          e.target.value = '';
+        }
+      };
+
+      // Susun teks detail pesanan untuk dikirim sebagai caption foto ke grup Telegram
+      const buildPreOrderCaption = (po) => {
+        const metodeLabel = po.metodePickup === 'ojol' ? 'Ojek Online' : 'Ambil Sendiri';
+        return `🛍️ *PRE ORDER PESANAN BARU*\n\n`
+          + `📅 Tgl Pesan: ${po.tanggalPesanan}\n`
+          + `👤 Pemesan: ${po.namaPemesan}\n`
+          + `📝 Pesanan:\n${po.isiPesanan}\n\n`
+          + `⏰ Pickup: ${po.pickupTanggal} pukul ${po.pickupJam}\n`
+          + `🚚 Metode: ${metodeLabel}\n`
+          + `🏪 Toko: ${storeName || storeId}`;
+      };
+
+      const handleSavePreOrder = async () => {
+        if (!preOrderForm.namaPemesan.trim()) { showToast('⚠️ Isi nama pemesan terlebih dahulu.'); return; }
+        if (!preOrderForm.isiPesanan.trim()) { showToast('⚠️ Isi detail pesanan terlebih dahulu.'); return; }
+        if (!preOrderForm.pickupTanggal || !preOrderForm.pickupJam) { showToast('⚠️ Isi tanggal & jam pickup terlebih dahulu.'); return; }
+        if (!preOrderForm.buktiPreview) { showToast('⚠️ Unggah bukti pembayaran/struk terlebih dahulu.'); return; }
+        if (!config.telegramBotToken || !config.telegramChatId) {
+          showToast('⚠️ Isi Bot Token & Chat ID Telegram di menu pengaturan (Roda Gigi) dahulu!');
+          setShowConfig(true);
+          return;
+        }
+        // Dibuat dari input tanggal+jam apa adanya (waktu lokal browser toko) supaya jadwal
+        // pengingat "1 jam sebelum pickup" di server tetap akurat sesuai jam toko setempat.
+        const pickupAt = new Date(`${preOrderForm.pickupTanggal}T${preOrderForm.pickupJam}:00`).getTime();
+        if (!pickupAt || isNaN(pickupAt)) { showToast('⚠️ Tanggal/jam pickup tidak valid.'); return; }
+
+        setIsSavingPreOrder(true);
+        try {
+          const now = Date.now();
+          // Upload bukti ke R2 dulu — database cuma menyimpan URL & key-nya, bukan base64 mentah,
+          // supaya storage tetap ringan (sama seperti Foto Rijek).
+          const { url: buktiUrl, key: buktiKeyR2 } = await uploadMediaToR2(preOrderForm.buktiPreview, `preOrders/${storeBase}`, 'jpg');
+          const payload = {
+            id: now.toString(),
+            tanggalPesanan: preOrderForm.tanggalPesanan,
+            namaPemesan: preOrderForm.namaPemesan.trim(),
+            isiPesanan: preOrderForm.isiPesanan.trim(),
+            bukti: buktiUrl,
+            buktiKey: buktiKeyR2,
+            pickupTanggal: preOrderForm.pickupTanggal,
+            pickupJam: preOrderForm.pickupJam,
+            pickupAt,
+            metodePickup: preOrderForm.metodePickup,
+            // reminderSent: dipakai server (cron) untuk menandai pengingat "1 jam sebelum pickup"
+            // sudah terkirim ke grup Telegram, supaya tidak dikirim berulang kali.
+            reminderSent: false,
+            createdAt: now,
+          };
+          // Kirim langsung ke grup Telegram sekarang juga (foto bukti + detail pesanan jadi caption)
+          await sendPhotoToTelegram(preOrderForm.buktiPreview, buildPreOrderCaption(payload));
+          // Simpan ke database — dipakai juga oleh server untuk pengingat otomatis 1 jam sebelum pickup
+          await restSet(db.ref(`${storeBase}/preOrders/` + now), payload);
+          showToast('Pre Order tersimpan & terkirim ke grup Telegram! 🎉');
+          setPreOrderList(prev => [...prev, { ...payload, firebaseKey: now.toString() }].sort((a, b) => (a.pickupAt || 0) - (b.pickupAt || 0)));
+          handleResetPreOrderForm();
+        } catch (error) {
+          console.error(error);
+          const detail = (error && error.message === 'NO_CONFIG')
+            ? 'Bot Token/Chat ID Telegram belum diisi.'
+            : 'Gagal mengirim/menyimpan Pre Order. Cek koneksi internet.';
+          showToast(`⚠️ ${detail}`);
+        } finally {
+          setIsSavingPreOrder(false);
+        }
+      };
+
+      const handleResetPreOrderForm = () => {
+        setPreOrderForm(getEmptyPreOrderForm());
+      };
+
+      const handleDeletePreOrder = async (firebaseKey) => {
+        try {
+          showToast('Menghapus Pre Order... 🗑️');
+          await restRemove(db.ref(`${storeBase}/preOrders/` + firebaseKey));
+          showToast('Pre Order berhasil dihapus.');
+          setPreOrderList(prev => prev.filter(item => item.firebaseKey !== firebaseKey));
+        } catch (error) {
+          console.error('Gagal menghapus Pre Order:', error);
+          const detail = (error && error.message) ? error.message : 'Kesalahan tidak diketahui';
+          showToast(`⚠️ Gagal menghapus Pre Order: ${detail}`);
+        }
+      };
+
+      // Kelompokkan foto berdasarkan kategori, lengkap dengan total jumlah
+      const groupWasteFotosByCategory = (list) => {
+        const groups = {};
+        Object.keys(WASTE_CATEGORIES).forEach(key => {
+          groups[key] = { items: [], total: 0 };
+        });
+        list.forEach(item => {
+          const cat = groups[item.kategori] ? item.kategori : 'bunRijek';
+          if (!groups[cat]) groups[cat] = { items: [], total: 0 };
+          groups[cat].items.push(item);
+          groups[cat].total += numVal(item.jumlah);
+        });
+        return groups;
+      };
+
+      // Daftar tanggal unik yang punya riwayat foto, terbaru di atas (untuk dropdown pilih hari)
+      const wasteFotoAvailableDates = Array.from(new Set(wasteFotoList.map(it => it.tanggal))).sort((a, b) => b.localeCompare(a));
+
+      // Foto yang sesuai dengan tanggal riwayat yang sedang dilihat
+      const wasteFotoListForViewDate = wasteFotoList.filter(it => it.tanggal === wasteFotoViewDate);
+      const wasteFotoGroups = groupWasteFotosByCategory(wasteFotoListForViewDate);
+
+      const handleWasteFotoViewYesterday = () => {
+        const d = new Date(wasteFotoViewDate + 'T00:00:00');
+        d.setDate(d.getDate() - 1);
+        setWasteFotoViewDate(d.toISOString().split('T')[0]);
+      };
+
+      const handleWasteFotoViewToday = () => {
+        setWasteFotoViewDate(new Date().toISOString().split('T')[0]);
+      };
+
+      // Gabungkan beberapa foto (base64) menjadi satu gambar kolase grid agar rapi saat dikirim ke Telegram
+      const buildPhotoCollage = (base64List, maxPerRow = 3, gap = 8) => {
+        return new Promise((resolve, reject) => {
+          if (!base64List || base64List.length === 0) { reject(new Error('Tidak ada foto')); return; }
+          // Sesuaikan ukuran sel agar kolase tidak membengkak saat foto banyak
+          const cellSize = base64List.length > 12 ? 220 : (base64List.length > 6 ? 260 : 320);
+          const imgs = [];
+          let loaded = 0;
+          base64List.forEach((src, idx) => {
+            const img = new Image();
+            // BUGFIX (2026-07-18): foto yang sudah ter-upload ke R2 sumbernya adalah URL
+            // https://.../api/media/file/... (beda origin dari halaman index.html ini),
+            // BUKAN base64 lagi walau nama variabelnya "base64List". Tanpa crossOrigin =
+            // 'anonymous', <canvas> yang menggambar foto cross-origin dianggap "tainted"
+            // oleh browser, dan canvas.toDataURL() di bawah langsung melempar
+            // "SecurityError: The operation is insecure." — inilah penyebab gagal kirim/
+            // gabung foto. Worker sudah mengirim header Access-Control-Allow-Origin yang
+            // benar di /api/media/file/, jadi cukup minta gambarnya dalam mode CORS di sini.
+            // Untuk data: URL (foto yang belum sempat ter-upload) baris ini aman diabaikan
+            // browser, tidak menimbulkan efek samping apa pun.
+            img.crossOrigin = 'anonymous';
+            img.onload = () => {
+              imgs[idx] = img;
+              loaded++;
+              if (loaded === base64List.length) {
+                const cols = Math.min(maxPerRow, base64List.length);
+                const rows = Math.ceil(base64List.length / cols);
+                const canvas = document.createElement('canvas');
+                canvas.width = cols * cellSize + (cols + 1) * gap;
+                canvas.height = rows * cellSize + (rows + 1) * gap;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                imgs.forEach((im, i) => {
+                  const col = i % cols;
+                  const row = Math.floor(i / cols);
+                  const x = gap + col * (cellSize + gap);
+                  const y = gap + row * (cellSize + gap);
+                  // crop tengah (cover) supaya proporsional dalam sel persegi
+                  const srcSize = Math.min(im.width, im.height);
+                  const sx = (im.width - srcSize) / 2;
+                  const sy = (im.height - srcSize) / 2;
+                  ctx.drawImage(im, sx, sy, srcSize, srcSize, x, y, cellSize, cellSize);
+                  ctx.strokeStyle = '#E2E8F0';
+                  ctx.lineWidth = 2;
+                  ctx.strokeRect(x, y, cellSize, cellSize);
+                });
+                resolve(canvas.toDataURL('image/jpeg', 0.75));
+              }
+            };
+            img.onerror = () => reject(new Error('Gagal memuat salah satu foto'));
+            img.src = src;
+          });
+        });
+      };
+
+      // Ubah data URL base64 (hasil kompresi foto) menjadi Blob TANPA memakai fetch().
+      // PENTING: memakai fetch(dataUrl) untuk mengonversi data: URL diblokir oleh
+      // Content-Security-Policy 'connect-src' pada halaman ini (connect-src tidak
+      // mengizinkan skema data:), sehingga pengiriman foto ke Telegram gagal total/
+      // tidak terkirim. Konversi manual berikut tidak melewati jaringan sama sekali,
+      // jadi tidak terpengaruh CSP dan juga lebih cepat.
+      const dataUrlToBlob = (dataUrl) => {
+        const parts = dataUrl.split(',');
+        const meta = parts[0] || '';
+        const mimeMatch = meta.match(/data:(.*?);base64/);
+        const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+        const binary = atob(parts[1] || '');
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        return new Blob([bytes], { type: mime });
+      };
+
+      // Kirim foto ke Telegram sekali percobaan (dipakai internal oleh sendPhotoToTelegram)
+      const sendPhotoToTelegramOnce = async (base64DataUrl, caption, token, chatId) => {
+        const blob = dataUrlToBlob(base64DataUrl);
+        const formData = new FormData();
+        formData.append('chat_id', chatId);
+        formData.append('caption', caption);
+        formData.append('parse_mode', 'Markdown');
+        formData.append('photo', blob, 'foto.jpg');
+
+        // Batasi waktu tunggu agar tidak menggantung tanpa batas saat koneksi HP lemah/lambat
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
+        try {
+          const response = await fetchWithRetry(`https://api.telegram.org/bot${token}/sendPhoto`, {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal
+          });
+          // Jangan langsung response.json() tanpa guard: kalau Telegram merespons
+          // non-JSON (mis. HTML error 404 karena token salah), .json() akan melempar
+          // error generik yang membingungkan. Tangani secara eksplisit di sini.
+          let result;
+          try {
+            result = await response.json();
+          } catch (parseErr) {
+            throw new Error(`Server Telegram merespons status ${response.status} (bukan format yang dikenali). Cek Bot Token & Chat ID.`);
+          }
+          if (!result.ok) {
+            // Tampilkan pesan asli dari Telegram (mis. "Unauthorized" = token salah,
+            // "chat not found" = Chat ID salah, "can't parse entities" = ada karakter
+            // spesial di teks) supaya penyebab sebenarnya langsung terlihat, bukan
+            // disamaratakan jadi "cek koneksi internet".
+            throw new Error(result.description || `Telegram menolak permintaan (kode ${result.error_code || '-'})`);
+          }
+          return result;
+        } catch (err) {
+          if (err.name === 'AbortError') {
+            throw new Error('Koneksi terlalu lambat (timeout 30 detik)');
+          }
+          if (err instanceof TypeError) {
+            // fetch() gagal total sebelum sempat dapat respons (benar-benar putus koneksi/DNS/CORS)
+            throw new Error('Tidak bisa menghubungi server Telegram (jaringan terputus atau diblokir).');
+          }
+          throw err;
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      };
+
+      // Kirim 1 foto + caption ke Telegram (sendPhoto). Dipakai bersama oleh Foto
+      // Rijek/Waste dan fitur pengiriman foto lainnya.
+      const sendPhotoToTelegram = async (base64DataUrl, caption) => {
+        // .trim() PENTING: Bot Token / Chat ID yang di-copy-paste dari Telegram sering
+        // membawa spasi atau baris baru tak terlihat di awal/akhir. Kalau tidak dibuang,
+        // URL request jadi tidak valid dan pengiriman gagal total tanpa pesan yang jelas.
+        const token = (config.telegramBotToken || '').trim();
+        const chatId = (config.telegramChatId || '').trim();
+        if (!token || !chatId) {
+          throw new Error('NO_CONFIG');
+        }
+        try {
+          return await sendPhotoToTelegramOnce(base64DataUrl, caption, token, chatId);
+        } catch (err) {
+          // Coba otomatis sekali lagi kalau percobaan pertama gagal (mis. jaringan mobile
+          // sempat berkedip), supaya laporan tetap terkirim tanpa harus klik ulang manual.
+          console.warn('Percobaan pertama kirim foto ke Telegram gagal, mencoba ulang sekali:', err.message);
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          return await sendPhotoToTelegramOnce(base64DataUrl, caption, token, chatId);
+        }
+      };
+
+      // Kirim langsung dari FORM INPUT (belum disimpan ke Riwayat) — stempel dulu foto-nya
+      // dengan keterangan+jam saat ini sebelum dikirim, sama seperti alur "Simpan ke Riwayat".
+      const handleQuickSendWasteFotoToTelegram = async () => {
+        if (!wasteFotoForm.fotoPreview) return;
+        try {
+          const stampedFoto = await stampWasteFotoImage(
+            wasteFotoForm.fotoPreview,
+            buildWasteFotoStampLines(wasteFotoForm.kategori, wasteFotoForm.jumlah, wasteFotoForm.keterangan)
+          );
+          await handleSendSingleWasteFotoToTelegram({ ...wasteFotoForm, foto: stampedFoto, tanggal: new Date().toISOString().split('T')[0] });
+        } catch (error) {
+          console.error(error);
+          showToast('Gagal menyiapkan stempel foto sebelum mengirim.');
+        }
+      };
+
+      // Kirim satu entri foto waste/rijek langsung ke Telegram (dipakai tombol "Kirim" per-foto,
+      // baik dari Riwayat yang sudah tersimpan & sudah distempel, maupun lewat wrapper
+      // handleQuickSendWasteFotoToTelegram di atas untuk foto yang belum disimpan)
+      const handleSendSingleWasteFotoToTelegram = async (item) => {
+        if (!config.telegramBotToken || !config.telegramChatId) {
+          showToast('⚠️ Isi Bot Token & Chat ID Telegram di menu pengaturan (Roda Gigi) dahulu!');
+          setShowConfig(true);
+          return;
+        }
+        const catInfo = WASTE_CATEGORIES[item.kategori] || WASTE_CATEGORIES.bunRijek;
+        const caption = `*${catInfo.label.toUpperCase()}*\nTanggal: ${formatIndonesianDate(item.tanggal)}\nJumlah: ${item.jumlah} pcs\nKeterangan: ${item.keterangan || '-'}`;
+        try {
+          showToast('Mengirim foto ke Telegram... ✈️');
+          await sendPhotoToTelegram(item.foto, caption);
+          showToast('Foto berhasil dikirim ke Telegram! 🚀');
+        } catch (error) {
+          console.error(error);
+          showToast(`Gagal mengirim foto: ${error.message}`);
+        }
+      };
+
+      // Kirim rekap total + seluruh foto dalam satu kategori ke Telegram Grup (foto digabung jadi 1 kolase agar rapi)
+      const handleSendCategoryRecapToTelegram = async (categoryKey) => {
+        if (!config.telegramBotToken || !config.telegramChatId) {
+          showToast('⚠️ Isi Bot Token & Chat ID Telegram di menu pengaturan (Roda Gigi) dahulu!');
+          setShowConfig(true);
+          return;
+        }
+        const group = wasteFotoGroups[categoryKey];
+        const catInfo = WASTE_CATEGORIES[categoryKey];
+        if (!group || group.items.length === 0) {
+          showToast('Belum ada foto pada kategori ini.');
+          return;
+        }
+
+        setSendingCategory(categoryKey);
+        try {
+          showToast(`Menggabungkan & mengirim foto ${catInfo.short}... ✈️`);
+
+          const orderedItems = group.items.slice().reverse();
+          const tanggalLabel = formatIndonesianDate(wasteFotoViewDate);
+
+          // 1. Buat 1 gambar kolase dari semua foto kategori ini (rapi, tidak terpisah-pisah)
+          const collageDataUrl = await buildPhotoCollage(orderedItems.map(it => it.foto));
+
+          // 2. Susun caption gabungan: total + keterangan tiap foto di bawahnya
+          let caption = `*REKAP ${catInfo.label.toUpperCase()}*\n${tanggalLabel}\n\n`;
+          orderedItems.forEach((it, idx) => {
+            caption += `${idx + 1}. ${it.jumlah} pcs - ${it.keterangan || '-'}\n`;
+          });
+          caption += `\n*TOTAL ${catInfo.short.toUpperCase()} : ${group.total} pcs*`;
+
+          // Telegram caption foto dibatasi ~1024 karakter; jika kepanjangan, kirim teks rekap penuh terpisah
+          if (caption.length > 1000) {
+            await fetchWithRetry(`https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: config.telegramChatId, text: caption, parse_mode: 'Markdown' })
+            });
+            const shortCaption = `*${catInfo.label.toUpperCase()}*\n${tanggalLabel}\n*TOTAL : ${group.total} pcs* (${orderedItems.length} foto)`;
+            await sendPhotoToTelegram(collageDataUrl, shortCaption);
+          } else {
+            await sendPhotoToTelegram(collageDataUrl, caption);
+          }
+
+          showToast(`Kolase & rekap ${catInfo.short} berhasil dikirim! 🚀`);
+        } catch (error) {
+          console.error(error);
+          showToast('Gagal mengirim rekap ke Telegram. Cek koneksi internet.');
+        } finally {
+          setSendingCategory(null);
+        }
+      };
+
+      // Kirim rekap keseluruhan (semua kategori) sekaligus ke Telegram, hanya teks total per kategori
+      const handleSendAllCategoriesRecapToTelegram = async () => {
+        if (!config.telegramBotToken || !config.telegramChatId) {
+          showToast('⚠️ Isi Bot Token & Chat ID Telegram di menu pengaturan (Roda Gigi) dahulu!');
+          setShowConfig(true);
+          return;
+        }
+        const hasAny = Object.values(wasteFotoGroups).some(g => g.items.length > 0);
+        if (!hasAny) {
+          showToast('Belum ada foto yang tersimpan di Riwayat.');
+          return;
+        }
+
+        setSendingCategory('ALL');
+        try {
+          showToast('Mengirim rekap total semua kategori... ✈️');
+          const todayStr = formatIndonesianDate(wasteFotoViewDate);
+          let text = `*REKAP TOTAL FOTO WASTE / RIJEK*\n${todayStr}\n\n`;
+          Object.keys(WASTE_CATEGORIES).forEach(key => {
+            const catInfo = WASTE_CATEGORIES[key];
+            const group = wasteFotoGroups[key];
+            text += `${catInfo.short} : *${group.total} pcs* (${group.items.length} foto)\n`;
+          });
+          text += `\nTerima Kasih 🙏🏻`;
+
+          const response = await fetchWithRetry(`https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: config.telegramChatId,
+              text: text,
+              parse_mode: 'Markdown'
+            })
+          });
+          const result = await response.json();
+          if (result.ok) {
+            showToast('Rekap total berhasil dikirim ke Telegram! 🚀');
+          } else {
+            showToast(`Gagal: ${result.description}`);
+          }
+        } catch (error) {
+          console.error(error);
+          showToast('Koneksi bermasalah saat mengirim rekap.');
+        } finally {
+          setSendingCategory(null);
+        }
+      };
+
+      const handleExportCSV = () => {
+        let csvContent = "data:text/csv;charset=utf-8,";
+        csvContent += "Tanggal,Roti Terjual (Pcs),Pendapatan (IDR),Suhu Freezer,Suhu Chiller,Dough Gagal Baking,Roti Matang Reject,Topping Taro Terpakai (KG)\n";
+        
+        historyList.forEach(item => {
+          const row = [
+            item.tanggal,
+            item.totalSales,
+            item.revenue,
+            item.sales.suhuFreezer,
+            item.sales.suhuChiller,
+            item.sales.waste.doughGagalBaking,
+            item.sales.waste.rotiMatang,
+            ((item.totalSales * 25) / 1000).toFixed(3)
+          ].join(",");
+          csvContent += row + "\n";
+        });
+
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        link.setAttribute("download", `Laporan_Tarobun_${salesData.tanggal}.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        showToast('File CSV berhasil diunduh! 📊');
+      };
+
+      const loadHistoryToActive = (item) => {
+        setSalesData(item.sales);
+        setInventoryData(item.inventory);
+        setActiveTab('dashboard');
+        showToast(`Memuat data tanggal: ${item.tanggal} 🔄`);
+      };
+
+      return (
+        <div className="min-h-screen bg-slate-50 text-slate-800">
+          {showUpdatePopup && systemUpdate && (
+            // RESPONSIF (fix): sebelumnya kartu ini tidak punya batas tinggi/scroll, jadi kalau
+            // teks update panjang (banyak baris/emoji), di layar HP (bukan mode desktop, viewport
+            // pendek) kartu bisa melebihi tinggi layar — bagian atas/tombol "Paham" jadi terpotong
+            // dan tidak terjangkau. Sekarang: overlay boleh discroll (overflow-y-auto + py-6) dan
+            // kartu dibatasi max-h-[85vh] dengan area teks (bukan seluruh kartu) yang discroll
+            // sendiri, supaya ikon & tombol "Paham" tetap selalu terlihat/terjangkau di kartu yang sama.
+            <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center p-4 py-6 overflow-y-auto animate-fadeIn">
+              <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 border border-purple-100 animate-scaleIn max-h-[85vh] flex flex-col">
+                <div className="w-14 h-14 rounded-full bg-purple-100 flex items-center justify-center text-2xl mx-auto mb-4 shrink-0">
+                  📢
+                </div>
+                <h3 className="text-center font-bold text-slate-800 text-base mb-2 shrink-0">Update Sistem</h3>
+                <div className="overflow-y-auto min-h-0 mb-5 pr-1">
+                  <p className="text-center text-sm text-slate-600 whitespace-pre-line">{systemUpdate.text}</p>
+                </div>
+                <button
+                  onClick={dismissSystemUpdate}
+                  className="w-full bg-purple-800 hover:bg-purple-900 text-white font-bold py-3 rounded-xl text-sm transition-all shrink-0"
+                >
+                  Paham
+                </button>
+              </div>
+            </div>
+          )}
+          {/* Header */}
+          <header className="bg-gradient-to-r from-purple-800 to-indigo-900 text-white shadow-md sticky top-0 z-20 px-4 py-3">
+            <div className="max-w-4xl mx-auto flex justify-between items-center">
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => setShowMenu(true)}
+                  className="p-2 -ml-1 bg-purple-700/60 hover:bg-purple-600 rounded-lg text-white border border-purple-500/30 transition-all"
+                  title="Menu"
+                >
+                  <i data-lucide="menu" className="w-5 h-5"></i>
+                </button>
+                <div className="bg-white text-purple-800 w-8 h-8 rounded-full font-bold flex items-center justify-center text-md tracking-wider">
+                  TB
+                </div>
+                <div className="min-w-0">
+                  <h1 className="font-display font-extrabold text-sm md:text-base tracking-wide truncate">TAROBUN</h1>
+                  <p className="text-[10px] text-purple-200 truncate flex items-center gap-1.5">
+                    <span>Toko: {storeName}</span>
+                    <span className="flex items-center gap-1 shrink-0">
+                      <PresenceDot isOnline={isNetworkOnline} size="w-1.5 h-1.5" />
+                      <span className={isNetworkOnline ? 'text-emerald-300' : 'text-rose-300'}>{isNetworkOnline ? 'Terhubung' : 'Tidak ada koneksi'}</span>
+                    </span>
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => { setActiveTab('chat'); setUnreadChat(0); }}
+                  className="relative p-2 bg-purple-700/60 hover:bg-purple-600 rounded-lg text-white border border-purple-500/30 transition-all"
+                  title="Chat dengan Admin"
+                >
+                  <i data-lucide="message-circle" className="w-5 h-5"></i>
+                  {unreadChat > 0 && (
+                    <span className="absolute -top-1 -right-1 bg-rose-500 text-white text-[9px] font-bold w-4 h-4 rounded-full flex items-center justify-center">{unreadChat > 9 ? '9+' : unreadChat}</span>
+                  )}
+                </button>
+                <button
+                  onClick={onLogout}
+                  className="p-2 bg-purple-700/60 hover:bg-rose-600 rounded-lg text-white border border-purple-500/30 transition-all"
+                  title="Keluar"
+                >
+                  <i data-lucide="log-out" className="w-5 h-5"></i>
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Banner peringatan koneksi terputus — muncul otomatis begitu offline, hilang otomatis
+              begitu koneksi pulih. Tujuannya supaya toko sadar SEBELUM mengisi laporan panjang,
+              bukan baru tahu setelah tombol "Simpan" gagal & harus mengulang. */}
+          {!isNetworkOnline && (
+            <div className="bg-rose-600 text-white text-center text-xs font-bold px-4 py-2 flex items-center justify-center gap-2 sticky top-[52px] z-20">
+              <i data-lucide="wifi-off" className="w-3.5 h-3.5"></i>
+              Tidak ada koneksi internet — data belum tentu tersimpan. Periksa WiFi/kuota Anda.
+            </div>
+          )}
+
+          {showOnboarding && (
+            <TourGuide
+              steps={STORE_ONBOARDING_STEPS}
+              onFinish={finishStoreOnboarding}
+              onOpenMenu={setShowMenu}
+            />
+          )}
+          {showMandatoryChecklist && (
+            <MandatoryChecklistModal items={MANDATORY_STORE_CHECKLIST} onAcknowledge={() => setShowMandatoryChecklist(false)} />
+          )}
+
+          {/* Sidebar Hamburger Menu */}
+          {showMenu && (
+            <div className="fixed inset-0 z-40 flex">
+              {/* Overlay */}
+              <div className="fixed inset-0 bg-black/50 animate-fadeIn" onClick={() => setShowMenu(false)}></div>
+
+              {/* Panel */}
+              <div className="relative bg-white w-72 max-w-[80%] h-full shadow-xl flex flex-col animate-slideInLeft">
+                <div className="bg-gradient-to-r from-purple-800 to-indigo-900 text-white px-4 py-4 flex items-center justify-between">
+                  <div className="flex items-center space-x-2">
+                    <div className="bg-white text-purple-800 w-8 h-8 rounded-full font-bold flex items-center justify-center text-md tracking-wider">
+                      TB
+                    </div>
+                    <div>
+                      <h2 className="font-display font-extrabold text-sm tracking-wide">TAROBUN</h2>
+                      <p className="text-[10px] text-purple-200">Menu Navigasi</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setShowMenu(false)} className="p-1.5 hover:bg-white/10 rounded-lg">
+                    <i data-lucide="x" className="w-5 h-5"></i>
+                  </button>
+                </div>
+
+                <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-1">
+                  <button data-tour="menu-dashboard" onClick={() => { setActiveTab('dashboard'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'dashboard' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="trending-up" className="w-4 h-4"></i>
+                    <span>Dasbor</span>
+                  </button>
+                  <button data-tour="menu-sales" onClick={() => { setActiveTab('sales'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'sales' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="plus-circle" className="w-4 h-4"></i>
+                    <span>Laporan Penjualan</span>
+                  </button>
+                  <button data-tour="menu-inventory" onClick={() => { setActiveTab('inventory'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'inventory' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="package" className="w-4 h-4"></i>
+                    <span>SO Stok</span>
+                  </button>
+                  <button data-tour="menu-preorder" onClick={() => { setActiveTab('preorder'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'preorder' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="calendar-clock" className="w-4 h-4"></i>
+                    <span>PO (Pre Order)</span>
+                  </button>
+                  <button data-tour="menu-bap" onClick={() => { setActiveTab('bap'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'bap' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="clipboard-check" className="w-4 h-4"></i>
+                    <span>BAP (Berita Acara Penyesuaian)</span>
+                  </button>
+                  <button data-tour="menu-kedatangan" onClick={() => { setActiveTab('kedatangan'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'kedatangan' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="truck" className="w-4 h-4"></i>
+                    <span>Datang Barang</span>
+                  </button>
+                  <button data-tour="menu-wasteFoto" onClick={() => { setActiveTab('wasteFoto'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'wasteFoto' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="camera" className="w-4 h-4"></i>
+                    <span>Foto Rijek</span>
+                    <span className="ml-auto text-[10px] bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded-md">{wasteFotoList.length}</span>
+                  </button>
+                  <button data-tour="menu-printing" onClick={() => { setActiveTab('printing'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'printing' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="printer" className="w-4 h-4"></i>
+                    <span>Printing</span>
+                  </button>
+                  <button data-tour="menu-history" onClick={() => { setActiveTab('history'); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'history' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="history" className="w-4 h-4"></i>
+                    <span>Riwayat Laporan</span>
+                    <span className="ml-auto text-[10px] bg-indigo-100 text-indigo-700 font-bold px-1.5 py-0.5 rounded-md">{historyList.length}</span>
+                  </button>
+                  <button data-tour="menu-sop" onClick={() => { setActiveTab('sop'); setSelectedSopCategory(null); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'sop' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="book-open" className="w-4 h-4"></i>
+                    <span>Panduan SOP</span>
+                    <span className="ml-auto text-[10px] bg-indigo-100 text-indigo-700 font-bold px-1.5 py-0.5 rounded-md">{sopCategories.length}</span>
+                  </button>
+                  <button data-tour="menu-chat" onClick={() => { setActiveTab('chat'); setUnreadChat(0); setShowMenu(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${activeTab === 'chat' ? 'bg-purple-50 text-purple-800' : 'text-slate-600 hover:bg-slate-50'}`}>
+                    <i data-lucide="message-circle" className="w-4 h-4"></i>
+                    <span>Chat Admin</span>
+                    {unreadChat > 0 && <span className="ml-auto text-[10px] bg-rose-100 text-rose-700 font-bold px-1.5 py-0.5 rounded-md">{unreadChat}</span>}
+                  </button>
+
+                  <div className="pt-3 mt-3 border-t border-slate-100 space-y-1">
+                    <button onClick={() => { setShowConfig(!showConfig); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-all">
+                      <i data-lucide="settings" className="w-4 h-4"></i>
+                      <span>Pengaturan Integrasi</span>
+                    </button>
+                    <button onClick={() => { handleLoadSampleData(); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-amber-700 hover:bg-amber-50 transition-all">
+                      <i data-lucide="sparkles" className="w-4 h-4"></i>
+                      <span>Muat Data Contoh</span>
+                    </button>
+                    <button onClick={() => { setShowOnboarding(true); setShowMenu(false); }} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-all">
+                      <i data-lucide="help-circle" className="w-4 h-4"></i>
+                      <span>Lihat Tur Panduan</span>
+                    </button>
+                    <button onClick={onLogout} className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold text-rose-700 hover:bg-rose-50 transition-all">
+                      <i data-lucide="log-out" className="w-4 h-4"></i>
+                      <span>Keluar / Logout</span>
+                    </button>
+                  </div>
+                </nav>
+              </div>
+            </div>
+          )}
+
+          {/* Main Container */}
+          <main className="max-w-4xl w-full mx-auto p-4">
+            
+            {/* Connection Config Panel */}
+            {showConfig && (
+              <div className="bg-white rounded-2xl p-5 border border-purple-200 shadow-md mb-6 transition-all">
+                <div className="flex justify-between items-center pb-2 border-b border-slate-100 mb-4">
+                  <h3 className="font-bold text-slate-800 text-sm flex items-center gap-2">
+                    <i data-lucide="settings" className="w-4 h-4 text-purple-700"></i>
+                    <span>Pengaturan Integrasi Eksternal</span>
+                  </h3>
+                  <button onClick={() => setShowConfig(false)} className="text-slate-600 hover:text-slate-600 text-xs font-bold">Tutup</button>
+                </div>
+                <form onSubmit={handleSaveConfig} className="space-y-4">
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                    <p className="text-xs font-semibold text-slate-600 flex items-center gap-1.5 mb-2"><i data-lucide="lock" className="w-3.5 h-3.5"></i> Integrasi Bot Telegram</p>
+                    <p className="text-[11px] text-slate-500 mb-2">Bot Token & Chat ID sekarang diatur langsung oleh Admin Pusat dan tidak bisa diubah dari sini.</p>
+                    <p className="text-[11px] font-mono text-slate-600">
+                      Status: {config.telegramBotToken && config.telegramChatId ? <span className="text-emerald-600 font-bold">✓ Terhubung</span> : <span className="text-rose-500 font-bold">Belum diatur admin</span>}
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="md:col-span-2">
+                      <label htmlFor="google-app-script-web-app-url" className="block text-xs font-semibold text-slate-600 mb-1">Google App Script Web App URL</label>
+                      <input 
+                        id="google-app-script-web-app-url"
+                        type="text" 
+                        value={config.googleAppScriptUrl}
+                        onChange={(e) => setConfig({ ...config, googleAppScriptUrl: e.target.value })}
+                        placeholder="https://script.google.com/macros/s/.../exec"
+                        className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono"
+                      />
+                    </div>
+                  </div>
+                  <button type="submit" className="bg-purple-800 text-white font-bold text-xs px-4 py-2 rounded-lg hover:bg-purple-900">
+                    Simpan Konfigurasi
+                  </button>
+                </form>
+              </div>
+            )}
+
+            {/* Modal konfirmasi: field kosong sebelum Kirim Telegram/WA — WAJIB diisi, atau
+                otomatis diisi 0 kalau memang sengaja kosong. TIDAK muncul saat "Simpan di
+                Cloud" (Simpan tetap boleh jalan apa adanya, cukup notifikasi non-blocking). */}
+            {showEmptyFieldsSendModal && (
+              <div className="fixed inset-0 z-[96] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+                <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className="w-9 h-9 rounded-full bg-wheat-50 flex items-center justify-center shrink-0">
+                      <i data-lucide="alert-triangle" className="w-4 h-4 text-wheat-600"></i>
+                    </div>
+                    <h3 className="font-bold text-slate-800">Ada {emptyFieldsForModal.length} Field Kosong</h3>
+                  </div>
+                  <p className="text-xs text-slate-500 mb-2">Field berikut belum diisi. Sebelum dikirim ke {pendingSendAction === 'telegram' ? 'Telegram' : 'WhatsApp'}, field kosong akan otomatis diisi angka <b>0</b>:</p>
+                  <div className="max-h-40 overflow-y-auto bg-slate-50 border border-slate-200 rounded-xl p-2.5 mb-4">
+                    <ul className="text-[11px] text-slate-600 list-disc list-inside space-y-0.5">
+                      {emptyFieldsForModal.map((f, i) => (
+                        <li key={i}>{f.sectionLabel} — {f.label}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => { setShowEmptyFieldsSendModal(false); setPendingSendAction(null); setEmptyFieldsForModal([]); }} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal, Isi Dulu</button>
+                    <button onClick={handleConfirmFillZeroAndSend} className="flex-1 bg-purple-800 text-white font-bold py-2.5 rounded-xl text-sm">Isi 0 & Kirim</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Date Selector */}
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 mb-6 flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center space-x-3">
+                <div className="bg-indigo-50 p-2.5 rounded-lg text-indigo-600">
+                  <i data-lucide="file-text" className="w-5 h-5"></i>
+                </div>
+                <div>
+                  <p className="text-[10px] text-slate-600 font-bold uppercase tracking-wider">Tanggal Kerja Aktif</p>
+                  <h2 className="font-bold text-slate-700 text-sm md:text-base">
+                    {formatIndonesianDate(salesData.tanggal)}
+                  </h2>
+                </div>
+              </div>
+              <div className="flex items-center space-x-2">
+                <input 
+                  type="date" 
+                  value={salesData.tanggal}
+                  onChange={(e) => {
+                    setSalesData({ ...salesData, tanggal: e.target.value });
+                    setInventoryData({ ...inventoryData, tanggal: e.target.value });
+                  }}
+                  className="px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-medium bg-slate-50"
+                />
+                <button 
+                  onClick={handleClearForm}
+                  className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg text-xs font-bold transition-all border border-slate-200"
+                >
+                  Hari Baru (Kosong)
+                </button>
+              </div>
+            </div>
+
+            {/* Notifications */}
+            {notification && (
+              <div className="bg-indigo-900 text-white rounded-lg px-4 py-3 shadow-lg fixed bottom-24 right-4 left-4 md:right-8 md:left-auto md:max-w-md z-50 flex items-center space-x-2">
+                <i data-lucide="check-circle" className="w-5 h-5 text-green-400"></i>
+                <span className="text-xs font-semibold">{notification}</span>
+              </div>
+            )}
+
+            {/* Tab: Dashboard */}
+            {activeTab === 'dashboard' && (
+              <div className="space-y-6">
+                
+                {/* Stats Grid */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                    <span className="text-[10px] text-slate-600 font-bold uppercase tracking-wider block mb-1">Roti Terjual</span>
+                    <span className="text-2xl font-extrabold text-indigo-900 block">{totalBunsSold} <span className="text-xs font-normal">pcs</span></span>
+                    <span className="text-[10px] text-slate-600 mt-1 block">Fam Box: {salesData.soldBuns.familyBox || 0}</span>
+                  </div>
+                  <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                    <span className="text-[10px] text-slate-600 font-bold uppercase tracking-wider block mb-1">Minuman</span>
+                    <span className="text-2xl font-extrabold text-purple-700 block">{totalBeveragesSold} <span className="text-xs font-normal">cup</span></span>
+                    <span className="text-[10px] text-slate-600 mt-1 block">Semua Varian Taro</span>
+                  </div>
+                  <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                    <span className="text-[10px] text-slate-600 font-bold uppercase tracking-wider block mb-1">Total EDC & Cash</span>
+                    <span className="text-md font-extrabold text-emerald-600 block truncate">Rp {numVal(salesData.financials.value).toLocaleString('id-ID')}</span>
+                    <span className="text-[10px] text-slate-600 mt-1 block">Tx: {salesData.financials.transaksi || 0}</span>
+                  </div>
+                  <div className="bg-white rounded-xl p-4 border border-slate-200 shadow-sm">
+                    <span className="text-[10px] text-slate-600 font-bold uppercase tracking-wider block mb-1">Gagal Baking / Roti Matang</span>
+                    <span className="text-xl font-extrabold text-amber-600 block">
+                      {numVal(salesData.waste.doughGagalBaking)} / {numVal(salesData.waste.rotiMatang)} <span className="text-xs font-normal">pcs</span>
+                    </span>
+                    <span className="text-[10px] text-slate-600 mt-1 block">Bake: {salesData.waste.doughGagalBaking || 0} | Matang: {salesData.waste.rotiMatang || 0}</span>
+                  </div>
+                </div>
+
+                {/* Formula Usage Card - BAKERY */}
+                <div className="bg-white rounded-2xl p-5 border border-purple-100 shadow-sm">
+                  <div className="pb-3 border-b border-slate-100 mb-4">
+                    <h3 className="font-bold text-slate-800 text-sm md:text-base flex items-center gap-2">
+                      <i data-lucide="trending-up" className="w-5 h-5 text-purple-700"></i>
+                      <span>Kebutuhan Bahan Bakery (Dough & Fillings)</span>
+                    </h3>
+                    <p className="text-xs text-slate-600">Konversi otomatis (x25g / 1000) ke satuan KG</p>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="bg-slate-50 rounded-xl p-4 flex flex-col justify-between">
+                      <div>
+                        <span className="text-xs font-bold text-slate-600 uppercase tracking-wider">Estimasi Frozen Dough Keluar</span>
+                        <div className="flex items-baseline space-x-1.5 mt-1">
+                          <span className="text-3xl font-black text-purple-800">{totalBunsSold}</span>
+                          <span className="text-xs font-semibold text-slate-500">pcs hari ini</span>
+                        </div>
+                      </div>
+                      <div className="mt-4">
+                        <div className="flex justify-between text-xs text-slate-500 mb-1">
+                          <span>Terpakai: {totalBunsSold} pcs</span>
+                          <span>Stok Gudang: {inventoryData.frozenDough || 0} pcs</span>
+                        </div>
+                        <div className="w-full bg-slate-200 rounded-full h-3">
+                          <div 
+                            className="bg-purple-600 h-3 rounded-full" 
+                            style={{ width: `${Math.min((totalBunsSold / (numVal(inventoryData.frozenDough) || 2000)) * 100, 100)}%` }}
+                          ></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <span className="text-xs font-bold text-slate-600 uppercase tracking-wider block">Kebutuhan Filling & Topping (KG)</span>
+                      
+                      <div className="flex justify-between items-center bg-purple-50 p-2 rounded-lg">
+                        <span className="text-xs font-bold text-slate-700">Topping Taro</span>
+                        <span className="text-xs font-bold bg-purple-100 text-purple-800 px-2.5 py-0.5 rounded-md">{toppingTaroUsedKg.toFixed(3)} kg</span>
+                      </div>
+                      <div className="flex justify-between items-center bg-amber-50 p-2 rounded-lg">
+                        <span className="text-xs font-bold text-slate-700">Filling Coklat</span>
+                        <span className="text-xs font-bold bg-amber-100 text-amber-900 px-2.5 py-0.5 rounded-md">{fillingCoklatUsedKg.toFixed(3)} kg</span>
+                      </div>
+                      <div className="flex justify-between items-center bg-yellow-50 p-2 rounded-lg">
+                        <span className="text-xs font-bold text-slate-700">Filling Vanilla</span>
+                        <span className="text-xs font-bold bg-yellow-100 text-yellow-900 px-2.5 py-0.5 rounded-md">{fillingVanillaUsedKg.toFixed(3)} kg</span>
+                      </div>
+                      <div className="flex justify-between items-center bg-orange-50 p-2 rounded-lg">
+                        <span className="text-xs font-bold text-slate-700">Filling Peach</span>
+                        <span className="text-xs font-bold bg-orange-100 text-orange-900 px-2.5 py-0.5 rounded-md">{fillingPeachUsedKg.toFixed(3)} kg</span>
+                      </div>
+                      <div className="flex justify-between items-center bg-lime-50 p-2 rounded-lg">
+                        <span className="text-xs font-bold text-slate-700">Filling Lemon</span>
+                        <span className="text-xs font-bold bg-lime-100 text-lime-900 px-2.5 py-0.5 rounded-md">{fillingLemonUsedKg.toFixed(3)} kg</span>
+                      </div>
+                      <div className="flex justify-between items-center bg-pink-50 p-2 rounded-lg">
+                        <span className="text-xs font-bold text-slate-700">Filling Raspberry</span>
+                        <span className="text-xs font-bold bg-pink-100 text-pink-900 px-2.5 py-0.5 rounded-md">{fillingRaspberryUsedKg.toFixed(3)} kg</span>
+                      </div>
+                      <div className="flex justify-between items-center bg-yellow-50 p-2 rounded-lg">
+                        <span className="text-xs font-bold text-slate-700">Filling Nanas</span>
+                        <span className="text-xs font-bold bg-yellow-100 text-yellow-800 px-2.5 py-0.5 rounded-md">{fillingNanasUsedKg.toFixed(3)} kg</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Formula Usage Card - BEVERAGES */}
+                <div className="bg-white rounded-2xl p-5 border border-sky-100 shadow-sm">
+                  <div className="pb-3 border-b border-slate-100 mb-4">
+                    <h3 className="font-bold text-slate-800 text-sm md:text-base flex items-center gap-2">
+                      <i data-lucide="coffee" className="w-5 h-5 text-sky-600"></i>
+                      <span>Kebutuhan Bahan Minuman (Hasil Konsolidasi)</span>
+                    </h3>
+                    <p className="text-xs text-slate-600">Penggabungan semua resep varian Taro yang terjual hari ini ke satuan KG</p>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-3">
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">Susu UHT Total</span>
+                        <span className="text-[10px] text-slate-500">Base + Str. Cheese + Blueberry</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevUhtKg.toFixed(3)} kg</span>
+                    </div>
+
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">NDC Powder</span>
+                        <span className="text-[10px] text-slate-500">Semua varian Taro terjual</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevNdcKg.toFixed(3)} kg</span>
+                    </div>
+
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">Taro Powder</span>
+                        <span className="text-[10px] text-slate-500">Semua varian Taro terjual</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevTaroPowderKg.toFixed(3)} kg</span>
+                    </div>
+
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">Whipping Cream</span>
+                        <span className="text-[10px] text-slate-500">Str. Cheese + Blueberry</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevWhipCreamKg.toFixed(3)} kg</span>
+                    </div>
+
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">Blueberry Saus</span>
+                        <span className="text-[10px] text-slate-500">Hanya Blueberry (20g/cup)</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevBlueberrySausKg.toFixed(3)} kg</span>
+                    </div>
+
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">Stroberi Saus</span>
+                        <span className="text-[10px] text-slate-500">Hanya Str. Cheese (20g/cup)</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevStrawSausKg.toFixed(3)} kg</span>
+                    </div>
+
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">Cheese Powder</span>
+                        <span className="text-[10px] text-slate-500">Hanya Strawberry Cheese</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevCheesePowderKg.toFixed(4)} kg</span>
+                    </div>
+
+                    <div className="flex justify-between items-center bg-sky-50 p-2.5 rounded-lg border border-sky-100">
+                      <div className="flex flex-col">
+                        <span className="text-xs font-bold text-slate-700">Stroberi Sirup</span>
+                        <span className="text-[10px] text-slate-500">Hanya Blueberry</span>
+                      </div>
+                      <span className="text-sm font-black bg-sky-100 text-sky-800 px-2.5 py-1 rounded-md">{bevStrawSyrupKg.toFixed(3)} kg</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Send Buttons Card */}
+                <div className="bg-gradient-to-br from-indigo-800 to-indigo-950 text-white rounded-2xl p-5 shadow-md">
+                  <h3 className="font-bold text-base mb-1">Simpan & Kirim Laporan Harian</h3>
+                  <p className="text-xs text-indigo-200 mb-4">Simpan data di memori Cloud Firebase dan bagikan langsung ke Group WhatsApp atau Telegram.</p>
+
+                  {emptyReportFieldsPreview.length > 0 && (
+                    <div className="bg-wheat-50/95 border border-wheat-500/40 text-wheat-600 text-[11px] rounded-xl p-2.5 mb-3 flex items-start gap-1.5">
+                      <i data-lucide="alert-triangle" className="w-3.5 h-3.5 shrink-0 mt-0.5"></i>
+                      <span><b>{emptyReportFieldsPreview.length} field belum diisi.</b> Boleh disimpan dulu; wajib diisi (atau otomatis jadi 0) saat mau Kirim Telegram/WA.</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <button onClick={handleSaveToDevice} className="bg-white text-indigo-950 font-bold text-xs py-2.5 rounded-xl flex items-center justify-center space-x-2 shadow-sm hover:bg-slate-100 transition-colors">
+                      <i data-lucide="cloud" className="w-4 h-4 text-indigo-800"></i>
+                      <span>Simpan di Cloud</span>
+                    </button>
+                    <button onClick={() => requestSendReport('telegram')} className="bg-sky-500 text-white font-bold text-xs py-2.5 rounded-xl flex items-center justify-center space-x-2 shadow-sm hover:bg-sky-400 transition-colors">
+                      <i data-lucide="send" className="w-4 h-4"></i>
+                      <span>Kirim Telegram</span>
+                    </button>
+                    <button onClick={() => requestSendReport('wa')} className="bg-emerald-600 text-white font-bold text-xs py-2.5 rounded-xl flex items-center justify-center space-x-2 shadow-sm hover:bg-emerald-500 transition-colors">
+                      <i data-lucide="share-2" className="w-4 h-4"></i>
+                      <span>Kirim WA</span>
+                    </button>
+                  </div>
+                </div>
+
+              </div>
+            )}
+
+            {/* Tab: Sales Inputs */}
+            {activeTab === 'sales' && (
+              <div className="bg-white rounded-2xl p-5 md:p-6 border border-slate-200 shadow-sm space-y-6">
+                <div>
+                  <h3 className="font-bold text-slate-800 text-lg">Laporan Penjualan & Financials</h3>
+                  <p className="text-xs text-slate-500">Nilai yang kosong tidak akan dihitung, memudahkan input harian.</p>
+                </div>
+
+                {/* Suhu */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-purple-800 uppercase tracking-wider border-b border-purple-50 pb-2">Pemantauan Suhu</h4>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label htmlFor="salesData_suhuFreezer" className="block text-xs font-semibold text-slate-600 mb-1.5">Suhu Freezer (°C)</label>
+                      <input id="salesData_suhuFreezer" type="number" value={salesData.suhuFreezer} onChange={(e) => setSalesData({ ...salesData, suhuFreezer: e.target.value })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="-18" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_suhuChiller" className="block text-xs font-semibold text-slate-600 mb-1.5">Suhu Chiller (°C)</label>
+                      <input id="salesData_suhuChiller" type="number" value={salesData.suhuChiller} onChange={(e) => setSalesData({ ...salesData, suhuChiller: e.target.value })} className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="2" />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Sold Buns */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-purple-800 uppercase tracking-wider border-b border-purple-50 pb-2">Roti Terjual (pcs)</h4>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div>
+                      <label htmlFor="salesData_soldBuns_original" className="block text-xs font-semibold text-slate-600 mb-1">Original</label>
+                      <input id="salesData_soldBuns_original" type="number" value={salesData.soldBuns.original} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, original: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBuns_coklat" className="block text-xs font-semibold text-slate-600 mb-1">Coklat</label>
+                      <input id="salesData_soldBuns_coklat" type="number" value={salesData.soldBuns.coklat} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, coklat: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBuns_vanilla" className="block text-xs font-semibold text-slate-600 mb-1">Vanilla</label>
+                      <input id="salesData_soldBuns_vanilla" type="number" value={salesData.soldBuns.vanilla} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, vanilla: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBuns_peach" className="block text-xs font-semibold text-slate-600 mb-1">Peach</label>
+                      <input id="salesData_soldBuns_peach" type="number" value={salesData.soldBuns.peach} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, peach: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBuns_lemon" className="block text-xs font-semibold text-slate-600 mb-1">Lemon</label>
+                      <input id="salesData_soldBuns_lemon" type="number" value={salesData.soldBuns.lemon} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, lemon: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBuns_raspberry" className="block text-xs font-semibold text-slate-600 mb-1">Raspberry</label>
+                      <input id="salesData_soldBuns_raspberry" type="number" value={salesData.soldBuns.raspberry} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, raspberry: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBuns_nanas" className="block text-xs font-semibold text-slate-600 mb-1">Nanas</label>
+                      <input id="salesData_soldBuns_nanas" type="number" value={salesData.soldBuns.nanas} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, nanas: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBuns_familyBox" className="block text-xs font-semibold text-slate-600 mb-1">Family Box (box)</label>
+                      <input id="salesData_soldBuns_familyBox" type="number" value={salesData.soldBuns.familyBox} onChange={(e) => setSalesData({ ...salesData, soldBuns: { ...salesData.soldBuns, familyBox: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div className="bg-purple-50 p-2.5 rounded-lg flex flex-col justify-center border border-purple-100">
+                      <span className="text-[10px] text-purple-700 font-bold uppercase tracking-wider">Total Bun Terjual</span>
+                      <span className="text-lg font-black text-purple-900">{totalBunsSold} pcs</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Sold Beverages */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-purple-800 uppercase tracking-wider border-b border-purple-50 pb-2">Minuman (cup)</h4>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div>
+                      <label htmlFor="salesData_soldBeverages_taroLatte" className="block text-xs font-semibold text-slate-600 mb-1">Taro Latte</label>
+                      <input id="salesData_soldBeverages_taroLatte" type="number" value={salesData.soldBeverages.taroLatte} onChange={(e) => setSalesData({ ...salesData, soldBeverages: { ...salesData.soldBeverages, taroLatte: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBeverages_chocolateIced" className="block text-xs font-semibold text-slate-600 mb-1">Chocolate Iced</label>
+                      <input id="salesData_soldBeverages_chocolateIced" type="number" value={salesData.soldBeverages.chocolateIced} onChange={(e) => setSalesData({ ...salesData, soldBeverages: { ...salesData.soldBeverages, chocolateIced: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBeverages_taroStrawberryCheese" className="block text-xs font-semibold text-slate-600 mb-1">Strawberry Cheese</label>
+                      <input id="salesData_soldBeverages_taroStrawberryCheese" type="number" value={salesData.soldBeverages.taroStrawberryCheese} onChange={(e) => setSalesData({ ...salesData, soldBeverages: { ...salesData.soldBeverages, taroStrawberryCheese: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_soldBeverages_taroBlueberry" className="block text-xs font-semibold text-slate-600 mb-1">Taro Blueberry</label>
+                      <input id="salesData_soldBeverages_taroBlueberry" type="number" value={salesData.soldBeverages.taroBlueberry} onChange={(e) => setSalesData({ ...salesData, soldBeverages: { ...salesData.soldBeverages, taroBlueberry: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Financials */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-purple-800 uppercase tracking-wider border-b border-purple-50 pb-2">Financials & Transaksi</h4>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div>
+                      <label htmlFor="salesData_financials_value" className="block text-xs font-semibold text-slate-600 mb-1">Total Omset (Rp)</label>
+                      <input id="salesData_financials_value" type="number" value={salesData.financials.value} onChange={(e) => setSalesData({ ...salesData, financials: { ...salesData.financials, value: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_financials_cash" className="block text-xs font-semibold text-slate-600 mb-1">Cash (Rp)</label>
+                      <input id="salesData_financials_cash" type="number" value={salesData.financials.cash} onChange={(e) => setSalesData({ ...salesData, financials: { ...salesData.financials, cash: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_financials_edc" className="block text-xs font-semibold text-slate-600 mb-1">EDC (Rp)</label>
+                      <input id="salesData_financials_edc" type="number" value={salesData.financials.edc} onChange={(e) => setSalesData({ ...salesData, financials: { ...salesData.financials, edc: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_financials_grab" className="block text-xs font-semibold text-slate-600 mb-1">Grab (Rp)</label>
+                      <input id="salesData_financials_grab" type="number" value={salesData.financials.grab} onChange={(e) => setSalesData({ ...salesData, financials: { ...salesData.financials, grab: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_financials_shopeeFood" className="block text-xs font-semibold text-slate-600 mb-1">ShopeeFood (Rp)</label>
+                      <input id="salesData_financials_shopeeFood" type="number" value={salesData.financials.shopeeFood} onChange={(e) => setSalesData({ ...salesData, financials: { ...salesData.financials, shopeeFood: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_financials_goFood" className="block text-xs font-semibold text-slate-600 mb-1">GoFood (Rp)</label>
+                      <input id="salesData_financials_goFood" type="number" value={salesData.financials.goFood} onChange={(e) => setSalesData({ ...salesData, financials: { ...salesData.financials, goFood: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_financials_transaksi" className="block text-xs font-semibold text-slate-600 mb-1">Jumlah Transaksi</label>
+                      <input id="salesData_financials_transaksi" type="number" value={salesData.financials.transaksi} onChange={(e) => setSalesData({ ...salesData, financials: { ...salesData.financials, transaksi: e.target.value } })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Waste */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-purple-800 uppercase tracking-wider border-b border-purple-50 pb-2">Waste (pcs)</h4>
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                    <div>
+                      <label htmlFor="salesData_waste_fdNempel" className="block text-[10px] font-semibold text-slate-600 mb-1">FD Nempel</label>
+                      <input id="salesData_waste_fdNempel" type="number" value={salesData.waste.fdNempel} onChange={(e) => setSalesData({ ...salesData, waste: { ...salesData.waste, fdNempel: e.target.value } })} className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_waste_bunRejectThawing" className="block text-[10px] font-semibold text-slate-600 mb-1">Reject Thaw</label>
+                      <input id="salesData_waste_bunRejectThawing" type="number" value={salesData.waste.bunRejectThawing} onChange={(e) => setSalesData({ ...salesData, waste: { ...salesData.waste, bunRejectThawing: e.target.value } })} className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_waste_doughPecahProofing" className="block text-[10px] font-semibold text-slate-600 mb-1">Dough Pecah</label>
+                      <input id="salesData_waste_doughPecahProofing" type="number" value={salesData.waste.doughPecahProofing} onChange={(e) => setSalesData({ ...salesData, waste: { ...salesData.waste, doughPecahProofing: e.target.value } })} className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="salesData_waste_doughGagalBaking" className="block text-[10px] font-semibold text-slate-600 mb-1">Gagal Bake</label>
+                      <input id="salesData_waste_doughGagalBaking" type="number" value={salesData.waste.doughGagalBaking} onChange={(e) => setSalesData({ ...salesData, waste: { ...salesData.waste, doughGagalBaking: e.target.value } })} className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs" placeholder="0" />
+                    </div>
+                    <div className="space-y-2">
+  <label htmlFor="waste-bun" className="block text-xs font-semibold text-slate-600">Waste Bun</label>
+  <input 
+    id="waste-bun"
+    type="number" 
+    value={salesData.waste.wasteBun} 
+    onChange={(e) => setSalesData({...salesData, waste: {...salesData.waste, wasteBun: e.target.value}})}
+    className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm" 
+    placeholder="0"
+  />
+</div>
+                    <div>
+                      <label htmlFor="salesData_waste_rotiMatang" className="block text-[10px] font-semibold text-slate-600 mb-1">Roti Matang</label>
+                      <input id="salesData_waste_rotiMatang" type="number" value={salesData.waste.rotiMatang} onChange={(e) => setSalesData({ ...salesData, waste: { ...salesData.waste, rotiMatang: e.target.value } })} className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs" placeholder="0" />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Field Tambahan dari Admin (Form Builder) */}
+                {customSalesFields.length > 0 && (
+                  <div>
+                    <h4 className="font-bold text-slate-700 text-sm mb-2 flex items-center gap-1.5"><i data-lucide="sparkles" className="w-3.5 h-3.5 text-purple-600"></i> Data Tambahan</h4>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                      {customSalesFields.map(f => (
+                        <div key={f.id}>
+                          <label htmlFor={`custom-field-${f.id}`} className="block text-[10px] font-semibold text-slate-600 mb-1">{f.label}{f.unit ? ` (${f.unit})` : ''}</label>
+                          <input
+                            id={`custom-field-${f.id}`}
+                            type={f.type === 'text' ? 'text' : 'number'}
+                            value={(salesData.custom || {})[f.id] || ''}
+                            onChange={(e) => setSalesData({ ...salesData, custom: { ...(salesData.custom || {}), [f.id]: e.target.value } })}
+                            className="w-full px-2 py-1.5 border border-slate-300 rounded-lg text-xs"
+                            placeholder="0"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Pemberitahuan field kosong — hanya notifikasi, TIDAK menghalangi Simpan */}
+                {emptyReportFieldsPreview.length > 0 && (
+                  <div className="bg-wheat-50 border border-wheat-500/40 text-wheat-600 text-xs rounded-xl p-3 flex items-start gap-2">
+                    <i data-lucide="alert-triangle" className="w-4 h-4 shrink-0 mt-0.5"></i>
+                    <div>
+                      <p className="font-bold">{emptyReportFieldsPreview.length} field belum diisi:</p>
+                      <p className="mt-0.5">{emptyReportFieldsPreview.slice(0, 12).map(f => f.label).join(', ')}{emptyReportFieldsPreview.length > 12 ? `, +${emptyReportFieldsPreview.length - 12} lainnya` : ''}</p>
+                      <p className="text-[10px] mt-1 opacity-80">Boleh disimpan dulu apa adanya. Wajib diisi (atau otomatis diisi 0) saat mengirim langsung ke Telegram/WA.</p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Saves */}
+                <div className="flex flex-col sm:flex-row gap-3 pt-4 border-t border-slate-100">
+                  <button onClick={handleSaveToDevice} className="flex-1 bg-purple-800 text-white font-bold py-3 rounded-xl hover:bg-purple-900 transition-colors">Simpan di Cloud</button>
+                  <button onClick={() => requestSendReport('telegram')} className="flex-1 bg-sky-600 text-white font-bold py-3 rounded-xl hover:bg-sky-700 transition-colors">Kirim Telegram</button>
+                  <button onClick={() => requestSendReport('wa')} className="flex-1 bg-emerald-600 text-white font-bold py-3 rounded-xl hover:bg-emerald-700 transition-colors">Kirim WA</button>
+                </div>
+              </div>
+            )}
+
+            {/* Tab: SO Inventory */}
+            {activeTab === 'inventory' && (
+              <div className="bg-white rounded-2xl p-5 md:p-6 border border-slate-200 shadow-sm space-y-6">
+                <div className="flex justify-between items-center">
+                  <div>
+                    <h3 className="font-bold text-slate-800 text-lg">Input SO Inventory (Stok Barang)</h3>
+                    <p className="text-xs text-slate-500">Form kosong - silakan masukkan sisa stok fisik di toko.</p>
+                  </div>
+                  <button 
+                    onClick={() => setInventoryData(getEmptyInventoryState(salesData.tanggal))}
+                    className="text-xs text-rose-600 font-bold border border-rose-100 bg-rose-50 px-3 py-1.5 rounded-lg hover:bg-rose-100"
+                  >
+                    Reset Form Stok
+                  </button>
+                </div>
+
+                {/* Section 1 */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2">Frozen Dough & Fillings</h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                    <div>
+                      <label htmlFor="inventoryData_frozenDough" className="block text-xs font-semibold text-slate-600 mb-1">Frozen Dough (pcs)</label>
+                      <input id="inventoryData_frozenDough" type="number" value={inventoryData.frozenDough} onChange={(e) => setInventoryData({ ...inventoryData, frozenDough: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_toppingTaro" className="block text-xs font-semibold text-purple-700 mb-1 font-bold">Topping Taro (pcs)</label>
+                      <input id="inventoryData_toppingTaro" type="number" value={inventoryData.toppingTaro} onChange={(e) => setInventoryData({ ...inventoryData, toppingTaro: e.target.value })} className="w-full px-3 py-1.5 border border-purple-200 bg-purple-50/10 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_fillingCoklat" className="block text-xs font-semibold text-slate-600 mb-1">Filling Coklat (pcs)</label>
+                      <input id="inventoryData_fillingCoklat" type="number" value={inventoryData.fillingCoklat} onChange={(e) => setInventoryData({ ...inventoryData, fillingCoklat: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_fillingVanilla" className="block text-xs font-semibold text-slate-600 mb-1">Filling Vanilla (pcs)</label>
+                      <input id="inventoryData_fillingVanilla" type="number" value={inventoryData.fillingVanilla} onChange={(e) => setInventoryData({ ...inventoryData, fillingVanilla: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_fillingLemon" className="block text-xs font-semibold text-slate-600 mb-1">Filling Lemon (pcs)</label>
+                      <input id="inventoryData_fillingLemon" type="number" value={inventoryData.fillingLemon} onChange={(e) => setInventoryData({ ...inventoryData, fillingLemon: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_fillingPeach" className="block text-xs font-semibold text-slate-600 mb-1">Filling Peach (pcs)</label>
+                      <input id="inventoryData_fillingPeach" type="number" value={inventoryData.fillingPeach} onChange={(e) => setInventoryData({ ...inventoryData, fillingPeach: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_fillingRaspberry" className="block text-xs font-semibold text-slate-600 mb-1">Filling Raspberry (pcs)</label>
+                      <input id="inventoryData_fillingRaspberry" type="number" value={inventoryData.fillingRaspberry} onChange={(e) => setInventoryData({ ...inventoryData, fillingRaspberry: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_fillingNanas" className="block text-xs font-semibold text-slate-600 mb-1">Filling Nanas (pcs)</label>
+                      <input id="inventoryData_fillingNanas" type="number" value={inventoryData.fillingNanas} onChange={(e) => setInventoryData({ ...inventoryData, fillingNanas: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    {/* Field Tambahan dari Admin khusus bagian Frozen Dough & Fillings */}
+                    {customInventoryFields.filter(f => f.section === 'dough').map(f => (
+                      <div key={f.id}>
+                        <label htmlFor={`custom-field-${f.id}`} className="block text-xs font-semibold text-slate-600 mb-1">{f.label}{f.unit ? ` (${f.unit})` : ''}</label>
+                        <input
+                          id={`custom-field-${f.id}`}
+                          type={f.type === 'text' ? 'text' : 'number'}
+                          value={(inventoryData.custom || {})[f.id] || ''}
+                          onChange={(e) => setInventoryData({ ...inventoryData, custom: { ...(inventoryData.custom || {}), [f.id]: e.target.value } })}
+                          className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm"
+                          placeholder="0"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Section 2 */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2">Ingredients & Powder</h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                    <div>
+                      <label htmlFor="inventoryData_uht" className="block text-xs font-semibold text-slate-600 mb-1">UHT (pcs)</label>
+                      <input id="inventoryData_uht" type="number" value={inventoryData.uht} onChange={(e) => setInventoryData({ ...inventoryData, uht: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_taroPowder" className="block text-xs font-semibold text-slate-600 mb-1">Taro Powder (kg)</label>
+                      <input id="inventoryData_taroPowder" type="number" step="0.1" value={inventoryData.taroPowder} onChange={(e) => setInventoryData({ ...inventoryData, taroPowder: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_coklatPowder" className="block text-xs font-semibold text-slate-600 mb-1">Coklat Powder (pack)</label>
+                      <input id="inventoryData_coklatPowder" type="number" value={inventoryData.coklatPowder} onChange={(e) => setInventoryData({ ...inventoryData, coklatPowder: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_whippingCream" className="block text-xs font-semibold text-slate-600 mb-1">Whipping Cream (pk)</label>
+                      <input id="inventoryData_whippingCream" type="number" value={inventoryData.whippingCream} onChange={(e) => setInventoryData({ ...inventoryData, whippingCream: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_ndcPowder" className="block text-xs font-semibold text-slate-600 mb-1">NDC Powder (pack)</label>
+                      <input id="inventoryData_ndcPowder" type="number" value={inventoryData.ndcPowder} onChange={(e) => setInventoryData({ ...inventoryData, ndcPowder: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_cheesePowder" className="block text-xs font-semibold text-slate-600 mb-1">Cheese Powder (pk)</label>
+                      <input id="inventoryData_cheesePowder" type="number" value={inventoryData.cheesePowder} onChange={(e) => setInventoryData({ ...inventoryData, cheesePowder: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_strawberryKonsentrat" className="block text-xs font-semibold text-slate-600 mb-1">Strawberry Kons (kg)</label>
+                      <input id="inventoryData_strawberryKonsentrat" type="number" value={inventoryData.strawberryKonsentrat} onChange={(e) => setInventoryData({ ...inventoryData, strawberryKonsentrat: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_strawberrySyrup" className="block text-xs font-semibold text-slate-600 mb-1">Strawberry Syrup (btl)</label>
+                      <input id="inventoryData_strawberrySyrup" type="number" value={inventoryData.strawberrySyrup} onChange={(e) => setInventoryData({ ...inventoryData, strawberrySyrup: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_blueberryKonsentrat" className="block text-xs font-semibold text-slate-600 mb-1">Blueberry Kons (pk)</label>
+                      <input id="inventoryData_blueberryKonsentrat" type="number" value={inventoryData.blueberryKonsentrat} onChange={(e) => setInventoryData({ ...inventoryData, blueberryKonsentrat: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm" placeholder="0" />
+                    </div>
+                    {/* Field Tambahan dari Admin khusus bagian Ingredients & Powder */}
+                    {customInventoryFields.filter(f => f.section === 'ingredients').map(f => (
+                      <div key={f.id}>
+                        <label htmlFor={`custom-field-${f.id}`} className="block text-xs font-semibold text-slate-600 mb-1">{f.label}{f.unit ? ` (${f.unit})` : ''}</label>
+                        <input
+                          id={`custom-field-${f.id}`}
+                          type={f.type === 'text' ? 'text' : 'number'}
+                          value={(inventoryData.custom || {})[f.id] || ''}
+                          onChange={(e) => setInventoryData({ ...inventoryData, custom: { ...(inventoryData.custom || {}), [f.id]: e.target.value } })}
+                          className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm"
+                          placeholder="0"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Section 3 */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2">Packaging & Operations</h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+                    <div>
+                      <label htmlFor="inventoryData_paperPouch" className="block text-slate-600 mb-1">Paper Pouch (pcs)</label>
+                      <input id="inventoryData_paperPouch" type="number" value={inventoryData.paperPouch} onChange={(e) => setInventoryData({ ...inventoryData, paperPouch: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_familyPack" className="block text-slate-600 mb-1">Family Pack (pcs)</label>
+                      <input id="inventoryData_familyPack" type="number" value={inventoryData.familyPack} onChange={(e) => setInventoryData({ ...inventoryData, familyPack: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_plastik20" className="block text-slate-600 mb-1">Plastik UK 20 (pack)</label>
+                      <input id="inventoryData_plastik20" type="number" value={inventoryData.plastik20} onChange={(e) => setInventoryData({ ...inventoryData, plastik20: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_plastik25" className="block text-slate-600 mb-1">Plastik UK 25 (pack)</label>
+                      <input id="inventoryData_plastik25" type="number" value={inventoryData.plastik25} onChange={(e) => setInventoryData({ ...inventoryData, plastik25: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_plastik35" className="block text-slate-600 mb-1">Plastik UK 35 (pack)</label>
+                      <input id="inventoryData_plastik35" type="number" value={inventoryData.plastik35} onChange={(e) => setInventoryData({ ...inventoryData, plastik35: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_cupbler22" className="block text-slate-600 mb-1">Cupbler 22 Oz (pcs)</label>
+                      <input id="inventoryData_cupbler22" type="number" value={inventoryData.cupbler22} onChange={(e) => setInventoryData({ ...inventoryData, cupbler22: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_cuplid22" className="block text-slate-600 mb-1">Cuplid 22 Oz (pcs)</label>
+                      <input id="inventoryData_cuplid22" type="number" value={inventoryData.cuplid22} onChange={(e) => setInventoryData({ ...inventoryData, cuplid22: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_cupTrayS" className="block text-slate-600 mb-1">Cup Tray S (pcs)</label>
+                      <input id="inventoryData_cupTrayS" type="number" value={inventoryData.cupTrayS} onChange={(e) => setInventoryData({ ...inventoryData, cupTrayS: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_cupTrayM" className="block text-slate-600 mb-1">Cup Tray M (pcs)</label>
+                      <input id="inventoryData_cupTrayM" type="number" value={inventoryData.cupTrayM} onChange={(e) => setInventoryData({ ...inventoryData, cupTrayM: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_glovesM" className="block text-slate-600 mb-1">Gloves M (pack)</label>
+                      <input id="inventoryData_glovesM" type="number" value={inventoryData.glovesM} onChange={(e) => setInventoryData({ ...inventoryData, glovesM: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_glovesL" className="block text-slate-600 mb-1">Gloves L (pack)</label>
+                      <input id="inventoryData_glovesL" type="number" value={inventoryData.glovesL} onChange={(e) => setInventoryData({ ...inventoryData, glovesL: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_glovesXL" className="block text-slate-600 mb-1">Gloves XL (pack)</label>
+                      <input id="inventoryData_glovesXL" type="number" value={inventoryData.glovesXL} onChange={(e) => setInventoryData({ ...inventoryData, glovesXL: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_trashBag" className="block text-slate-600 mb-1">Trash Bag (pack)</label>
+                      <input id="inventoryData_trashBag" type="number" value={inventoryData.trashBag} onChange={(e) => setInventoryData({ ...inventoryData, trashBag: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_thermalPaper" className="block text-slate-600 mb-1">Thermal Paper (pcs)</label>
+                      <input id="inventoryData_thermalPaper" type="number" value={inventoryData.thermalPaper} onChange={(e) => setInventoryData({ ...inventoryData, thermalPaper: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_kuraflexHijau" className="block text-slate-600 mb-1">Kuraflex Hijau (pack)</label>
+                      <input id="inventoryData_kuraflexHijau" type="number" value={inventoryData.kuraflexHijau} onChange={(e) => setInventoryData({ ...inventoryData, kuraflexHijau: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_kuraflexPink" className="block text-slate-600 mb-1">Kuraflex Pink (pack)</label>
+                      <input id="inventoryData_kuraflexPink" type="number" value={inventoryData.kuraflexPink} onChange={(e) => setInventoryData({ ...inventoryData, kuraflexPink: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_kitchenMask" className="block text-slate-600 mb-1">Kitchen Mask (pack)</label>
+                      <input id="inventoryData_kitchenMask" type="number" value={inventoryData.kitchenMask} onChange={(e) => setInventoryData({ ...inventoryData, kitchenMask: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_tisuKecil" className="block text-slate-600 mb-1">Tisu Kecil (pack)</label>
+                      <input id="inventoryData_tisuKecil" type="number" value={inventoryData.tisuKecil} onChange={(e) => setInventoryData({ ...inventoryData, tisuKecil: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    <div>
+                      <label htmlFor="inventoryData_tisuBesar" className="block text-slate-600 mb-1">Tisu Besar (pack)</label>
+                      <input id="inventoryData_tisuBesar" type="number" value={inventoryData.tisuBesar} onChange={(e) => setInventoryData({ ...inventoryData, tisuBesar: e.target.value })} className="w-full px-3 py-1.5 border border-slate-300 rounded-lg" placeholder="0" />
+                    </div>
+                    {/* Field Tambahan dari Admin khusus bagian Packaging & Operations */}
+                    {customInventoryFields.filter(f => f.section === 'packaging').map(f => (
+                      <div key={f.id}>
+                        <label htmlFor={`custom-field-${f.id}`} className="block text-slate-600 mb-1">{f.label}{f.unit ? ` (${f.unit})` : ''}</label>
+                        <input
+                          id={`custom-field-${f.id}`}
+                          type={f.type === 'text' ? 'text' : 'number'}
+                          value={(inventoryData.custom || {})[f.id] || ''}
+                          onChange={(e) => setInventoryData({ ...inventoryData, custom: { ...(inventoryData.custom || {}), [f.id]: e.target.value } })}
+                          className="w-full px-3 py-1.5 border border-slate-300 rounded-lg"
+                          placeholder="0"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Field Tambahan dari Admin (Form Builder) — hanya field yang bagiannya "Lainnya"
+                    atau field lama sebelum fitur pemilihan Bagian ini ada (belum punya section) */}
+                {customInventoryFields.filter(f => !f.section || f.section === 'lainnya').length > 0 && (
+                  <div className="space-y-4">
+                    <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2 flex items-center gap-1.5"><i data-lucide="sparkles" className="w-3.5 h-3.5"></i> Data Tambahan</h4>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-xs">
+                      {customInventoryFields.filter(f => !f.section || f.section === 'lainnya').map(f => (
+                        <div key={f.id}>
+                          <label htmlFor={`custom-field-${f.id}`} className="block text-slate-600 mb-1">{f.label}{f.unit ? ` (${f.unit})` : ''}</label>
+                          <input
+                            id={`custom-field-${f.id}`}
+                            type={f.type === 'text' ? 'text' : 'number'}
+                            value={(inventoryData.custom || {})[f.id] || ''}
+                            onChange={(e) => setInventoryData({ ...inventoryData, custom: { ...(inventoryData.custom || {}), [f.id]: e.target.value } })}
+                            className="w-full px-3 py-1.5 border border-slate-300 rounded-lg"
+                            placeholder="0"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Pemberitahuan field kosong — hanya notifikasi, TIDAK menghalangi Simpan */}
+                {emptyReportFieldsPreview.length > 0 && (
+                  <div className="bg-wheat-50 border border-wheat-500/40 text-wheat-600 text-xs rounded-xl p-3 flex items-start gap-2">
+                    <i data-lucide="alert-triangle" className="w-4 h-4 shrink-0 mt-0.5"></i>
+                    <div>
+                      <p className="font-bold">{emptyReportFieldsPreview.length} field belum diisi (Laporan Penjualan + SO Stok):</p>
+                      <p className="mt-0.5">{emptyReportFieldsPreview.slice(0, 12).map(f => f.label).join(', ')}{emptyReportFieldsPreview.length > 12 ? `, +${emptyReportFieldsPreview.length - 12} lainnya` : ''}</p>
+                      <p className="text-[10px] mt-1 opacity-80">Boleh disimpan dulu apa adanya. Wajib diisi (atau otomatis diisi 0) saat mengirim langsung ke Telegram/WA lewat tab Laporan Penjualan.</p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Save Inventory */}
+                <div className="pt-4 border-t border-slate-100">
+                  <button onClick={handleSaveToDevice} className="w-full bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-3 rounded-xl transition-all shadow-sm">
+                    Simpan Data Cloud & Hitung
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Tab: Pre Order Pesanan */}
+            {activeTab === 'preorder' && (
+              <div className="space-y-6">
+
+                {/* Form Input Pre Order */}
+                <div className="bg-white rounded-2xl p-5 md:p-6 border border-slate-200 shadow-sm space-y-5">
+                  <div>
+                    <h3 className="font-bold text-slate-800 text-lg">Input Pre Order Pesanan</h3>
+                    <p className="text-xs text-slate-500">Catat pesanan pre order pelanggan. Data akan langsung dikirim ke grup Telegram, dan otomatis diingatkan lagi 1 jam sebelum waktu pickup.</p>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label htmlFor="preorder_tanggalPesanan" className="block text-xs font-semibold text-slate-600 mb-1.5">Tanggal Pesanan</label>
+                      <input
+                        id="preorder_tanggalPesanan"
+                        type="date"
+                        value={preOrderForm.tanggalPesanan}
+                        onChange={(e) => setPreOrderForm({ ...preOrderForm, tanggalPesanan: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="preorder_namaPemesan" className="block text-xs font-semibold text-slate-600 mb-1.5">Nama Pemesan</label>
+                      <input
+                        id="preorder_namaPemesan"
+                        type="text"
+                        value={preOrderForm.namaPemesan}
+                        onChange={(e) => setPreOrderForm({ ...preOrderForm, namaPemesan: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                        placeholder="Contoh: Bu Sari"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label htmlFor="preorder_isiPesanan" className="block text-xs font-semibold text-slate-600 mb-1.5">Isi Pesanan</label>
+                    <textarea
+                      id="preorder_isiPesanan"
+                      rows={3}
+                      value={preOrderForm.isiPesanan}
+                      onChange={(e) => setPreOrderForm({ ...preOrderForm, isiPesanan: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      placeholder={"Contoh:\n- Taro Original x2\n- Coklat Lava x1"}
+                    ></textarea>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label htmlFor="preorder_pickupTanggal" className="block text-xs font-semibold text-slate-600 mb-1.5">Tanggal Pickup</label>
+                      <input
+                        id="preorder_pickupTanggal"
+                        type="date"
+                        value={preOrderForm.pickupTanggal}
+                        onChange={(e) => setPreOrderForm({ ...preOrderForm, pickupTanggal: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="preorder_pickupJam" className="block text-xs font-semibold text-slate-600 mb-1.5">Jam Pickup</label>
+                      <input
+                        id="preorder_pickupJam"
+                        type="time"
+                        value={preOrderForm.pickupJam}
+                        onChange={(e) => setPreOrderForm({ ...preOrderForm, pickupJam: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Metode Pickup */}
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-2">Metode Pickup</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => setPreOrderForm({ ...preOrderForm, metodePickup: 'ambilSendiri' })}
+                        className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-bold border transition-all ${preOrderForm.metodePickup === 'ambilSendiri' ? 'bg-purple-600 text-white border-purple-600' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                      >
+                        <i data-lucide="user-check" className="w-4 h-4"></i>
+                        <span>Ambil Sendiri</span>
+                      </button>
+                      <button
+                        onClick={() => setPreOrderForm({ ...preOrderForm, metodePickup: 'ojol' })}
+                        className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-bold border transition-all ${preOrderForm.metodePickup === 'ojol' ? 'bg-purple-600 text-white border-purple-600' : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                      >
+                        <i data-lucide="bike" className="w-4 h-4"></i>
+                        <span>Ojek Online</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Bukti Pembayaran & Struk */}
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-2">Bukti Pembayaran & Struk</label>
+                    {preOrderForm.buktiPreview ? (
+                      <div className="relative inline-block">
+                        <img src={preOrderForm.buktiPreview} alt="Preview Bukti Bayar" className="w-40 h-40 object-cover rounded-xl border border-slate-200 shadow-sm" />
+                        <button
+                          onClick={() => setPreOrderForm({ ...preOrderForm, buktiPreview: null })}
+                          className="absolute -top-2 -right-2 bg-rose-600 text-white rounded-full p-1.5 shadow-md hover:bg-rose-700"
+                          title="Hapus foto"
+                        >
+                          <i data-lucide="x" className="w-3.5 h-3.5"></i>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
+                          <i data-lucide="camera" className="w-6 h-6 text-purple-700"></i>
+                          <span className="text-xs font-bold text-slate-600">Foto Langsung</span>
+                          <input type="file" accept="image/*" capture="environment" onChange={handleBuktiFotoFileChange} className="hidden" />
+                        </label>
+                        <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
+                          <i data-lucide="image" className="w-6 h-6 text-indigo-700"></i>
+                          <span className="text-xs font-bold text-slate-600">Pilih Galeri</span>
+                          <input type="file" accept="image/*" onChange={handleBuktiFotoFileChange} className="hidden" />
+                        </label>
+                      </div>
+                    )}
+                    {isCompressingBukti && <p className="text-xs text-slate-400 mt-2">Memproses foto...</p>}
+                  </div>
+
+                  <button
+                    onClick={handleSavePreOrder}
+                    disabled={isSavingPreOrder}
+                    className="w-full bg-purple-700 hover:bg-purple-800 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
+                  >
+                    <i data-lucide="send" className="w-4 h-4"></i>
+                    <span>{isSavingPreOrder ? 'Mengirim...' : 'Simpan & Kirim ke Telegram'}</span>
+                  </button>
+                </div>
+
+                {/* Daftar Pre Order Mendatang */}
+                <div className="bg-white rounded-2xl p-5 md:p-6 border border-slate-200 shadow-sm">
+                  <h3 className="font-bold text-slate-800 text-base mb-3">Daftar Pre Order</h3>
+                  {preOrderList.length === 0 ? (
+                    <p className="text-xs text-slate-400 text-center py-6">Belum ada Pre Order tersimpan.</p>
+                  ) : (
+                    <div className="space-y-3">
+                      {preOrderList.map(po => (
+                        <div key={po.firebaseKey} className="flex items-start justify-between gap-3 border border-slate-100 rounded-xl p-3">
+                          <div className="min-w-0">
+                            <p className="font-semibold text-sm text-slate-800 truncate">{po.namaPemesan}</p>
+                            <p className="text-xs text-slate-500 whitespace-pre-line">{po.isiPesanan}</p>
+                            <p className="text-[11px] text-slate-400 mt-1">
+                              Pickup: {po.pickupTanggal} • {po.pickupJam} • {po.metodePickup === 'ojol' ? 'Ojek Online' : 'Ambil Sendiri'}
+                            </p>
+                            <span className={`inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${po.reminderSent ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
+                              {po.reminderSent ? '✓ Sudah diingatkan' : 'Menunggu pengingat H-1 jam'}
+                            </span>
+                          </div>
+                          <button onClick={() => handleDeletePreOrder(po.firebaseKey)} className="text-rose-500 shrink-0" title="Hapus">
+                            <i data-lucide="trash-2" className="w-4 h-4"></i>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Tab: BAP (Laporan Selisih Transaksi) */}
+            {activeTab === 'bap' && (
+              <div className="space-y-6">
+
+                <div className="bg-white rounded-2xl p-5 md:p-6 border border-slate-200 shadow-sm space-y-6">
+                  <div className="flex justify-between items-start gap-3">
+                    <div>
+                      <h3 className="font-bold text-slate-800 text-lg">Input Laporan BAP</h3>
+                      <p className="text-xs text-slate-500">Catat selisih nominal antara POS dengan channel pembayaran/pesan-antar, lalu kirim ke Telegram.</p>
+                    </div>
+                    <button
+                      onClick={handleResetBapForm}
+                      className="text-xs text-rose-600 font-bold border border-rose-100 bg-rose-50 px-3 py-1.5 rounded-lg hover:bg-rose-100 whitespace-nowrap"
+                    >
+                      Reset Form
+                    </button>
+                  </div>
+
+                  {/* Outlet (otomatis dari sesi login) & Tanggal */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1.5">Outlet</label>
+                      <div className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm bg-slate-50 text-slate-700 font-semibold">
+                        {storeName || storeId}
+                      </div>
+                    </div>
+                    <div>
+                      <label htmlFor="tanggal-bap" className="block text-xs font-semibold text-slate-600 mb-1.5">Tanggal</label>
+                      <input
+                        id="tanggal-bap"
+                        type="date"
+                        value={bapForm.tanggal}
+                        onChange={(e) => setBapForm({ ...bapForm, tanggal: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-slate-50"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Transaksi */}
+                  <div>
+                    <label htmlFor="transaksi-bap" className="block text-xs font-semibold text-slate-600 mb-1.5">Transaksi</label>
+                    <select
+                      id="transaksi-bap"
+                      value={bapForm.transaksi}
+                      onChange={(e) => setBapForm({ ...bapForm, transaksi: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white"
+                    >
+                      {BAP_TRANSAKSI_OPTIONS.map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Nominal POS & Nominal Channel */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label htmlFor="nominal-pos-bap" className="block text-xs font-semibold text-slate-600 mb-1.5">Nominal POS (Rp)</label>
+                      <input
+                        id="nominal-pos-bap"
+                        type="number"
+                        value={bapForm.nominalPos}
+                        onChange={(e) => setBapForm({ ...bapForm, nominalPos: e.target.value })}
+                        placeholder="0"
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="nominal-channel-bap" className="block text-xs font-semibold text-slate-600 mb-1.5">Nominal {bapForm.transaksi} (Rp)</label>
+                      <input
+                        id="nominal-channel-bap"
+                        type="number"
+                        value={bapForm.nominalChannel}
+                        onChange={(e) => setBapForm({ ...bapForm, nominalChannel: e.target.value })}
+                        placeholder="0"
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Selisih (otomatis, tidak bisa diedit) */}
+                  <div className={`rounded-xl px-4 py-3 flex items-center justify-between ${bapSelisih > 0 ? 'bg-rose-50 border border-rose-100' : 'bg-emerald-50 border border-emerald-100'}`}>
+                    <span className={`text-xs font-bold ${bapSelisih > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>Selisih</span>
+                    <span className={`text-sm font-extrabold ${bapSelisih > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>Rp. {bapSelisih.toLocaleString('id-ID')}</span>
+                  </div>
+
+                  {/* Keterangan (otomatis terisi, tetap bisa diedit bebas) */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label htmlFor="keterangan-bap" className="block text-xs font-semibold text-slate-600">Keterangan</label>
+                      {!bapKeteranganAuto && (
+                        <button onClick={handleResetBapKeteranganOtomatis} className="text-[10px] font-bold text-purple-700 hover:underline">
+                          Isi Otomatis
+                        </button>
+                      )}
+                    </div>
+                    <textarea
+                      id="keterangan-bap"
+                      value={bapForm.keterangan}
+                      onChange={(e) => handleBapKeteranganChange(e.target.value)}
+                      rows={2}
+                      placeholder="Contoh: Selisih Rp. 200 dikarenakan sistem pada POS."
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                    />
+                  </div>
+
+                  {/* Preview teks yang akan dikirim ke Telegram */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                    <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Preview Laporan</p>
+                    <pre className="text-xs text-slate-700 whitespace-pre-wrap font-sans">{generateBapReportString(bapForm)}</pre>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={handleSaveBap}
+                      disabled={isSavingBap}
+                      className="bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
+                    >
+                      <i data-lucide={isSavingBap ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingBap ? 'animate-spin' : ''}`}></i>
+                      <span>{isSavingBap ? 'Menyimpan...' : 'Simpan ke Riwayat'}</span>
+                    </button>
+                    <button
+                      onClick={() => handleSendBapToTelegram(bapForm)}
+                      className="bg-sky-500 hover:bg-sky-400 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
+                    >
+                      <i data-lucide="send" className="w-4 h-4"></i>
+                      <span>Kirim Telegram</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Riwayat BAP */}
+                <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm space-y-4">
+                  <div className="pb-3 border-b border-slate-100">
+                    <h3 className="font-bold text-slate-800 text-base">Riwayat BAP</h3>
+                    <p className="text-xs text-slate-500">Tersimpan di Cloud, bisa dibuka & dicek kembali kapan saja.</p>
+                  </div>
+
+                  {bapHistoryList.length === 0 ? (
+                    <div className="text-center py-10 text-slate-600">
+                      <i data-lucide="clipboard-check" className="w-10 h-10 mx-auto mb-2 text-slate-600"></i>
+                      <p className="text-sm font-medium">Belum ada riwayat laporan BAP.</p>
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-slate-100">
+                      {bapHistoryList.map(item => (
+                        <div key={item.firebaseKey} className="py-3 flex justify-between items-center gap-2">
+                          <div className="min-w-0">
+                            <h4 className="font-bold text-slate-700 text-sm">{formatIndonesianDate(item.tanggal)} · {item.transaksi}</h4>
+                            <p className="text-xs text-slate-600 truncate">
+                              POS Rp {numVal(item.nominalPos).toLocaleString('id-ID')} vs {item.transaksi} Rp {numVal(item.nominalChannel).toLocaleString('id-ID')}
+                              {numVal(item.selisih) > 0 && <span className="text-rose-500 font-semibold"> · Selisih Rp {numVal(item.selisih).toLocaleString('id-ID')}</span>}
+                            </p>
+                          </div>
+                          <div className="flex items-center space-x-2 flex-shrink-0">
+                            <button onClick={() => loadBapToActive(item)} className="bg-purple-50 text-purple-700 text-xs font-bold px-2.5 py-1.5 rounded-lg border border-purple-100">Buka</button>
+                            <button onClick={() => handleSendBapToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1.5 rounded-lg border border-sky-100" title="Kirim Telegram"><i data-lucide="send" className="w-3.5 h-3.5"></i></button>
+                            <button onClick={() => handleDeleteBap(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100" title="Hapus"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Tab: Datang Barang */}
+            {activeTab === 'kedatangan' && (
+              <div className="space-y-6">
+
+                <div className="bg-white rounded-2xl p-5 md:p-6 border border-slate-200 shadow-sm space-y-6">
+                  <div className="flex justify-between items-start gap-3">
+                    <div>
+                      <h3 className="font-bold text-slate-800 text-lg">Input Kedatangan Barang</h3>
+                      <p className="text-xs text-slate-500">Pilih barang, isi jumlah yang datang. Frozen Dough s.d. Filling wajib pakai No. Faktur/Surat Jalan.</p>
+                    </div>
+                    <button
+                      onClick={handleResetKedatanganForm}
+                      className="text-xs text-rose-600 font-bold border border-rose-100 bg-rose-50 px-3 py-1.5 rounded-lg hover:bg-rose-100 whitespace-nowrap"
+                    >
+                      Reset Form
+                    </button>
+                  </div>
+
+                  {/* Tanggal & No Surat Jalan */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label htmlFor="tanggal-kedatangan" className="block text-xs font-semibold text-slate-600 mb-1.5">Tanggal Kedatangan</label>
+                      <input
+                        id="tanggal-kedatangan"
+                        type="date"
+                        value={kedatanganForm.tanggal}
+                        onChange={(e) => setKedatanganForm({ ...kedatanganForm, tanggal: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm bg-slate-50"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="no--faktur---surat-jalan--kop-khusus" className="block text-xs font-semibold text-purple-700 mb-1.5">No. Faktur / Surat Jalan (Kop Khusus)</label>
+                      <input
+                        id="no--faktur---surat-jalan--kop-khusus"
+                        type="text"
+                        value={kedatanganForm.noSuratJalan}
+                        onChange={(e) => setKedatanganForm({ ...kedatanganForm, noSuratJalan: e.target.value })}
+                        placeholder="Contoh: SJ/06/2026/0123"
+                        className="w-full px-3 py-2 border border-purple-200 rounded-lg text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Section: Frozen Dough s/d Filling - Kop Khusus */}
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-extrabold text-purple-800 uppercase tracking-wider border-b border-purple-50 pb-2 flex items-center gap-1.5">
+                      <i data-lucide="file-signature" className="w-3.5 h-3.5"></i>
+                      <span>Frozen Dough s.d. Filling (Kop Khusus)</span>
+                    </h4>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {KEDATANGAN_KOP_KHUSUS_ITEMS.map(item => {
+                        const khususVal = getKhususItemValue(kedatanganForm.items, item.key);
+                        return (
+                          <div key={item.key} className="bg-purple-50/30 border border-purple-100 rounded-xl p-3 space-y-2">
+                            <label htmlFor={`item-field-${item.key}`} className="block text-xs font-bold text-slate-700">{item.label} <span className="text-slate-600 font-normal">({item.unit})</span></label>
+                            <input
+                              id={`item-field-${item.key}`}
+                              type="number"
+                              value={khususVal.jumlah}
+                              onChange={(e) => handleKedatanganKhususChange(item.key, 'jumlah', e.target.value)}
+                              className="w-full px-3 py-1.5 border border-purple-200 bg-white rounded-lg text-sm"
+                              placeholder="Jumlah"
+                            />
+                            <div>
+                              <label htmlFor="tanggal-produksi" className="block text-[10px] font-semibold text-purple-600 mb-0.5">Tanggal Produksi</label>
+                              <input
+                                id="tanggal-produksi"
+                                type="text"
+                                value={khususVal.tanggalProduksi}
+                                onChange={(e) => handleKedatanganKhususChange(item.key, 'tanggalProduksi', e.target.value)}
+                                placeholder="Contoh: 20-06-2026"
+                                className="w-full px-2.5 py-1.5 border border-purple-200 bg-white rounded-lg text-xs"
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Section: Barang Umum */}
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-extrabold text-indigo-700 uppercase tracking-wider border-b border-indigo-50 pb-2 flex items-center gap-1.5">
+                      <i data-lucide="package" className="w-3.5 h-3.5"></i>
+                      <span>Barang Umum</span>
+                    </h4>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                      {KEDATANGAN_BARANG_UMUM_ITEMS.map(item => (
+                        <div key={item.key}>
+                          <label htmlFor={`item-field-${item.key}`} className="block text-xs font-semibold text-slate-600 mb-1">{item.label} ({item.unit})</label>
+                          <input
+                            id={`item-field-${item.key}`}
+                            type="number"
+                            value={kedatanganForm.items[item.key] || ''}
+                            onChange={(e) => handleKedatanganItemChange(item.key, e.target.value)}
+                            className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-sm"
+                            placeholder="0"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Section: Barang Tidak Sesuai Faktur/Surat Jalan */}
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-extrabold text-rose-700 uppercase tracking-wider border-b border-rose-50 pb-2 flex items-center gap-1.5">
+                      <i data-lucide="package-x" className="w-3.5 h-3.5"></i>
+                      <span>Barang Tidak Sesuai Faktur/Surat Jalan</span>
+                    </h4>
+                    <p className="text-[11px] text-slate-600">Untuk barang yang tertulis di faktur tapi tidak datang, atau datang tidak sesuai jumlah/jenis.</p>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-2 bg-rose-50/40 border border-rose-100 rounded-xl p-3">
+                      <input
+                        type="text"
+                        value={tidakSesuaiInput.nama}
+                        onChange={(e) => setTidakSesuaiInput({ ...tidakSesuaiInput, nama: e.target.value })}
+                        placeholder="Nama barang"
+                        className="px-3 py-1.5 border border-slate-300 rounded-lg text-sm sm:col-span-2"
+                      />
+                      <input
+                        type="number"
+                        value={tidakSesuaiInput.jumlah}
+                        onChange={(e) => setTidakSesuaiInput({ ...tidakSesuaiInput, jumlah: e.target.value })}
+                        placeholder="Jumlah"
+                        className="px-3 py-1.5 border border-slate-300 rounded-lg text-sm"
+                      />
+                      <select
+                        value={tidakSesuaiInput.satuan}
+                        onChange={(e) => setTidakSesuaiInput({ ...tidakSesuaiInput, satuan: e.target.value })}
+                        className="px-3 py-1.5 border border-slate-300 rounded-lg text-sm bg-white"
+                      >
+                        <option value="pcs">pcs</option>
+                        <option value="kg">kg</option>
+                        <option value="pack">pack</option>
+                        <option value="box">box</option>
+                        <option value="botol">botol</option>
+                      </select>
+                      <input
+                        type="text"
+                        value={tidakSesuaiInput.keterangan}
+                        onChange={(e) => setTidakSesuaiInput({ ...tidakSesuaiInput, keterangan: e.target.value })}
+                        placeholder="Keterangan (opsional)"
+                        className="px-3 py-1.5 border border-slate-300 rounded-lg text-sm sm:col-span-3"
+                      />
+                      <button
+                        onClick={handleAddTidakSesuai}
+                        className="bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-lg flex items-center justify-center gap-1.5 py-1.5"
+                      >
+                        <i data-lucide="plus" className="w-3.5 h-3.5"></i>
+                        <span>Tambah</span>
+                      </button>
+                    </div>
+
+                    {kedatanganForm.tidakSesuai.length > 0 && (
+                      <div className="divide-y divide-rose-100 border border-rose-100 rounded-xl overflow-hidden">
+                        {kedatanganForm.tidakSesuai.map(it => (
+                          <div key={it.id} className="flex justify-between items-center bg-rose-50/30 px-3 py-2">
+                            <div>
+                              <p className="text-xs font-bold text-slate-700">{it.nama} <span className="text-rose-700">- {it.jumlah} {it.satuan}</span></p>
+                              {it.keterangan && <p className="text-[10px] text-slate-500">{it.keterangan}</p>}
+                            </div>
+                            <button onClick={() => handleRemoveTidakSesuai(it.id)} className="text-rose-600 hover:bg-rose-100 p-1.5 rounded-lg">
+                              <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Tombol Simpan & Kirim */}
+                  <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row gap-2">
+                    <button
+                      onClick={handleSaveKedatangan}
+                      disabled={isSavingKedatangan}
+                      className="flex-1 bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
+                    >
+                      <i data-lucide={isSavingKedatangan ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingKedatangan ? 'animate-spin' : ''}`}></i>
+                      <span>{isSavingKedatangan ? 'Menyimpan...' : 'Simpan ke Riwayat'}</span>
+                    </button>
+                    <button
+                      onClick={() => handleSendKedatanganToTelegram(kedatanganForm)}
+                      className="bg-sky-500 hover:bg-sky-400 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
+                    >
+                      <i data-lucide="send" className="w-4 h-4"></i>
+                      <span>Kirim Telegram</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Riwayat Kedatangan Barang */}
+                <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm space-y-4">
+                  <div className="pb-3 border-b border-slate-100">
+                    <h3 className="font-bold text-slate-800 text-base">Riwayat Kedatangan Barang</h3>
+                    <p className="text-xs text-slate-500">Tersimpan di Cloud, bisa dibuka & dicek kembali kapan saja.</p>
+                  </div>
+
+                  {kedatanganHistoryList.length === 0 ? (
+                    <div className="text-center py-10 text-slate-600">
+                      <i data-lucide="truck" className="w-10 h-10 mx-auto mb-2 text-slate-600"></i>
+                      <p className="text-sm font-medium">Belum ada riwayat kedatangan barang.</p>
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-slate-100">
+                      {kedatanganHistoryList.map(item => {
+                        const itemCount = Object.values(item.items || {}).filter(v => {
+                          if (v && typeof v === 'object') return numVal(v.jumlah) > 0;
+                          return numVal(v) > 0;
+                        }).length;
+                        const tidakSesuaiCount = (item.tidakSesuai || []).length;
+                        return (
+                          <div key={item.firebaseKey} className="py-3 flex justify-between items-center gap-2">
+                            <div className="min-w-0">
+                              <h4 className="font-bold text-slate-700 text-sm">{formatIndonesianDate(item.tanggal)}</h4>
+                              <p className="text-xs text-slate-600 truncate">
+                                {itemCount} jenis barang{item.noSuratJalan ? ` · SJ: ${item.noSuratJalan}` : ''}
+                                {tidakSesuaiCount > 0 && <span className="text-rose-500 font-semibold"> · {tidakSesuaiCount} tidak sesuai</span>}
+                              </p>
+                            </div>
+                            <div className="flex items-center space-x-2 flex-shrink-0">
+                              <button onClick={() => loadKedatanganToActive(item)} className="bg-purple-50 text-purple-700 text-xs font-bold px-2.5 py-1.5 rounded-lg border border-purple-100">Buka</button>
+                              <button onClick={() => handleSendKedatanganToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1.5 rounded-lg border border-sky-100" title="Kirim Telegram"><i data-lucide="send" className="w-3.5 h-3.5"></i></button>
+                              <button onClick={() => handleDeleteKedatangan(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100" title="Hapus"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Tab: Foto Waste/Rijek */}
+            {activeTab === 'wasteFoto' && (
+              <div className="space-y-6">
+
+                {/* Form Input Foto */}
+                <div className="bg-white rounded-2xl p-5 md:p-6 border border-slate-200 shadow-sm space-y-5">
+                  <div>
+                    <h3 className="font-bold text-slate-800 text-lg">Input Foto Waste / Rijek</h3>
+                    <p className="text-xs text-slate-500">Ambil foto langsung dari kamera atau pilih dari galeri. Foto otomatis dikompresi agar ringan & aman tersimpan.</p>
+                  </div>
+
+                  {/* Pilih Kategori */}
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-2">Pilih Kategori</label>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      {Object.keys(WASTE_CATEGORIES).map(key => {
+                        const cat = WASTE_CATEGORIES[key];
+                        const styles = WASTE_COLOR_STYLES[cat.color];
+                        const active = wasteFotoForm.kategori === key;
+                        return (
+                          <button
+                            key={key}
+                            onClick={() => setWasteFotoForm({ ...wasteFotoForm, kategori: key })}
+                            className={`flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl text-xs font-bold border transition-all ${active ? styles.activeBtn : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'}`}
+                          >
+                            <i data-lucide={cat.icon} className="w-4 h-4"></i>
+                            <span>{cat.short}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Jumlah & Keterangan */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label htmlFor="jumlah--pcs" className="block text-xs font-semibold text-slate-600 mb-1.5">Jumlah (pcs)</label>
+                      <input
+                        id="jumlah--pcs"
+                        type="number"
+                        value={wasteFotoForm.jumlah}
+                        onChange={(e) => setWasteFotoForm({ ...wasteFotoForm, jumlah: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                        placeholder="0"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="keterangan" className="block text-xs font-semibold text-slate-600 mb-1.5">Keterangan</label>
+                      <input
+                        id="keterangan"
+                        type="text"
+                        value={wasteFotoForm.keterangan}
+                        onChange={(e) => setWasteFotoForm({ ...wasteFotoForm, keterangan: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm"
+                        placeholder="Contoh: Gosong saat baking"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Ambil / Pilih Foto */}
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-2">Foto</label>
+                    {wasteFotoForm.fotoPreview ? (
+                      <div className="relative inline-block">
+                        <img src={wasteFotoForm.fotoPreview} alt="Preview" className="w-40 h-40 object-cover rounded-xl border border-slate-200 shadow-sm" />
+                        <button
+                          onClick={() => setWasteFotoForm({ ...wasteFotoForm, fotoPreview: null })}
+                          className="absolute -top-2 -right-2 bg-rose-600 text-white rounded-full p-1.5 shadow-md hover:bg-rose-700"
+                          title="Hapus foto"
+                        >
+                          <i data-lucide="x" className="w-3.5 h-3.5"></i>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
+                          <i data-lucide="camera" className="w-6 h-6 text-purple-700"></i>
+                          <span className="text-xs font-bold text-slate-600">Foto Langsung</span>
+                          <input type="file" accept="image/*" capture="environment" onChange={handleWasteFotoFileChange} className="hidden" />
+                        </label>
+                        <label className="flex flex-col items-center justify-center gap-1.5 border-2 border-dashed border-slate-300 rounded-xl py-6 cursor-pointer hover:bg-slate-50 transition-all">
+                          <i data-lucide="image" className="w-6 h-6 text-indigo-700"></i>
+                          <span className="text-xs font-bold text-slate-600">Pilih Galeri</span>
+                          <input type="file" accept="image/*" onChange={handleWasteFotoFileChange} className="hidden" />
+                        </label>
+                      </div>
+                    )}
+                    {isCompressingFoto && (
+                      <p className="text-[11px] text-purple-600 font-semibold mt-2 flex items-center gap-1">
+                        <i data-lucide="loader" className="w-3.5 h-3.5 animate-spin"></i> Mengompres foto...
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Tombol Simpan */}
+                  <div className="pt-2 border-t border-slate-100 flex flex-col sm:flex-row gap-2">
+                    <button
+                      onClick={handleSaveWasteFoto}
+                      disabled={isSavingFoto || isCompressingFoto}
+                      className="flex-1 bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2"
+                    >
+                      <i data-lucide={isSavingFoto ? 'loader' : 'save'} className={`w-4 h-4 ${isSavingFoto ? 'animate-spin' : ''}`}></i>
+                      <span>{isSavingFoto ? 'Menyimpan...' : 'Simpan ke Riwayat'}</span>
+                    </button>
+                    <button
+                      onClick={handleQuickSendWasteFotoToTelegram}
+                      disabled={!wasteFotoForm.fotoPreview}
+                      className="bg-sky-500 hover:bg-sky-400 disabled:opacity-50 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-sm flex items-center justify-center gap-2 text-xs sm:text-sm"
+                    >
+                      <i data-lucide="send" className="w-4 h-4"></i>
+                      <span>Kirim Telegram</span>
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-slate-600 text-center">Setelah disimpan, form akan kosong otomatis agar bisa langsung input foto berikutnya.</p>
+                </div>
+
+                {/* Rekap Total Per Kategori */}
+                <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm space-y-4">
+                  <div className="flex justify-between items-center pb-3 border-b border-slate-100">
+                    <div>
+                      <h3 className="font-bold text-slate-800 text-base">Riwayat & Total Per Kategori</h3>
+                      <p className="text-xs text-slate-500">Foto terkumpul otomatis sesuai kategori, lengkap dengan total & keterangan.</p>
+                    </div>
+                    <button
+                      onClick={handleSendAllCategoriesRecapToTelegram}
+                      disabled={sendingCategory === 'ALL'}
+                      className="bg-indigo-800 hover:bg-indigo-900 disabled:opacity-50 text-white text-xs font-bold px-3 py-2 rounded-lg flex items-center gap-1.5 shadow-sm"
+                    >
+                      <i data-lucide={sendingCategory === 'ALL' ? 'loader' : 'send'} className={`w-3.5 h-3.5 ${sendingCategory === 'ALL' ? 'animate-spin' : ''}`}></i>
+                      <span>Kirim Semua Total</span>
+                    </button>
+                  </div>
+
+                  {/* Navigasi Tanggal Riwayat */}
+                  <div className="flex flex-wrap items-center gap-2 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                    <button
+                      onClick={handleWasteFotoViewYesterday}
+                      className="flex items-center gap-1 bg-white border border-slate-200 text-slate-600 text-xs font-bold px-2.5 py-1.5 rounded-lg hover:bg-slate-100"
+                    >
+                      <i data-lucide="chevron-left" className="w-3.5 h-3.5"></i>
+                      <span>Hari Sebelumnya</span>
+                    </button>
+                    <input
+                      type="date"
+                      value={wasteFotoViewDate}
+                      onChange={(e) => setWasteFotoViewDate(e.target.value)}
+                      className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-semibold bg-white"
+                    />
+                    <button
+                      onClick={handleWasteFotoViewToday}
+                      className="bg-purple-50 text-purple-700 border border-purple-100 text-xs font-bold px-2.5 py-1.5 rounded-lg hover:bg-purple-100"
+                    >
+                      Hari Ini
+                    </button>
+                    {wasteFotoAvailableDates.length > 0 && (
+                      <select
+                        value=""
+                        onChange={(e) => { if (e.target.value) setWasteFotoViewDate(e.target.value); }}
+                        className="px-2.5 py-1.5 border border-slate-300 rounded-lg text-xs bg-white text-slate-500 flex-1 min-w-[140px]"
+                      >
+                        <option value="">Lompat ke tanggal lain...</option>
+                        {wasteFotoAvailableDates.map(d => (
+                          <option key={d} value={d}>{formatIndonesianDate(d)}</option>
+                        ))}
+                      </select>
+                    )}
+                    <span className="text-xs font-bold text-purple-800 ml-auto">
+                      Menampilkan: {formatIndonesianDate(wasteFotoViewDate)}
+                    </span>
+                  </div>
+
+                  {Object.keys(WASTE_CATEGORIES).map(key => {
+                    const cat = WASTE_CATEGORIES[key];
+                    const styles = WASTE_COLOR_STYLES[cat.color];
+                    const group = wasteFotoGroups[key] || { items: [], total: 0 };
+                    return (
+                      <div key={key} className={`rounded-xl border p-4 ${styles.cardBorder} ${styles.cardBg}`}>
+                        <div className="flex justify-between items-center mb-3">
+                          <div className="flex items-center gap-2">
+                            <i data-lucide={cat.icon} className={`w-4 h-4 ${styles.icon}`}></i>
+                            <span className="font-bold text-sm text-slate-700">{cat.label}</span>
+                            <span className={`text-xs font-black px-2 py-0.5 rounded-md ${styles.badge}`}>
+                              Total: {group.total} pcs
+                            </span>
+                          </div>
+                          <button
+                            onClick={() => handleSendCategoryRecapToTelegram(key)}
+                            disabled={sendingCategory === key || group.items.length === 0}
+                            className="bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-white text-[11px] font-bold px-2.5 py-1.5 rounded-lg flex items-center gap-1 shadow-sm"
+                          >
+                            <i data-lucide={sendingCategory === key ? 'loader' : 'send'} className={`w-3 h-3 ${sendingCategory === key ? 'animate-spin' : ''}`}></i>
+                            <span>Kirim</span>
+                          </button>
+                        </div>
+
+                        {group.items.length === 0 ? (
+                          <p className="text-xs text-slate-600 text-center py-4">Belum ada foto pada kategori ini untuk tanggal {formatIndonesianDate(wasteFotoViewDate)}.</p>
+                        ) : (
+                          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                            {group.items.map(item => (
+                              <div key={item.firebaseKey} className="bg-white rounded-lg border border-slate-200 overflow-hidden shadow-sm">
+                                <img src={item.foto} alt={cat.short} className="w-full h-24 object-cover" />
+                                <div className="p-2 space-y-0.5">
+                                  <p className="text-xs font-bold text-slate-700">{item.jumlah} pcs</p>
+                                  <p className="text-[10px] text-slate-500 line-clamp-2">{item.keterangan || '-'}</p>
+                                  <p className="text-[9px] text-slate-600">{formatIndonesianDate(item.tanggal)}</p>
+                                  <div className="flex items-center justify-between pt-1">
+                                    <button onClick={() => handleSendSingleWasteFotoToTelegram(item)} className="text-sky-600 hover:bg-sky-50 p-1 rounded-md" title="Kirim ke Telegram">
+                                      <i data-lucide="send" className="w-3.5 h-3.5"></i>
+                                    </button>
+                                    <button onClick={() => handleDeleteWasteFoto(item.firebaseKey)} className="text-rose-600 hover:bg-rose-50 p-1 rounded-md" title="Hapus">
+                                      <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Tab: Printing (Premix & Catatan Stok) */}
+            {activeTab === 'printing' && (
+              <div className="space-y-4">
+                <div>
+                  <h2 className="font-bold text-slate-700 text-base flex items-center gap-2">
+                    <i data-lucide="printer" className="w-4 h-4 text-purple-700"></i>
+                    <span>Printing</span>
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-1">Cetak label Premix atau Catatan Stok. Kompatibel dengan printer biasa maupun printer thermal (58mm/80mm).</p>
+                </div>
+
+                <div className="flex bg-slate-100 rounded-xl p-1 gap-1">
+                  <button onClick={() => setPrintingSubTab('premix')} className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all ${printingSubTab === 'premix' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>Premix</button>
+                  <button onClick={() => setPrintingSubTab('stock')} className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all ${printingSubTab === 'stock' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>Catatan Stok</button>
+                  <button onClick={() => setPrintingSubTab('history')} className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all flex items-center justify-center gap-1 ${printingSubTab === 'history' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>
+                    <i data-lucide="history" className="w-3.5 h-3.5"></i>
+                    <span>Riwayat</span>
+                  </button>
+                </div>
+
+                {printingSubTab === 'premix' && (
+                  <form onSubmit={handlePremixPrint} className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm space-y-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">Nama Toko</label>
+                      <input type="text" value={premixForm.namaToko} onChange={(e) => handlePremixFormChange('namaToko', e.target.value)} className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">Nama Barang</label>
+                      <input type="text" value={premixForm.namaBarang} onChange={(e) => handlePremixFormChange('namaBarang', e.target.value)} placeholder="Contoh: Premix Coklat" className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-600 mb-1">Tanggal Buat</label>
+                        <input type="date" value={premixForm.tanggalBuat} onChange={(e) => handlePremixFormChange('tanggalBuat', e.target.value)} className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold text-slate-600 mb-1">Tanggal Exp</label>
+                        <input type="date" value={premixForm.tanggalExp} onChange={(e) => handlePremixFormChange('tanggalExp', e.target.value)} className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">Asal Bahan Produksi</label>
+                      <input type="text" value={premixForm.asalBahan} onChange={(e) => handlePremixFormChange('asalBahan', e.target.value)} placeholder="Contoh: Gudang Pusat / Dapur Toko" className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" />
+                    </div>
+                    <button type="submit" className="w-full bg-purple-800 hover:bg-purple-900 text-white font-bold py-3 rounded-xl text-sm flex items-center justify-center gap-2">
+                      <i data-lucide="printer" className="w-4 h-4"></i>
+                      <span>Cetak Label Premix</span>
+                    </button>
+                  </form>
+                )}
+
+                {printingSubTab === 'stock' && (
+                  <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm space-y-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">Nama Toko</label>
+                      <input type="text" value={stockNoteStore} onChange={(e) => setStockNoteStore(e.target.value)} className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" required />
+                    </div>
+
+                    <div className="border border-slate-200 rounded-xl p-3 space-y-3">
+                      <p className="text-xs font-semibold text-slate-600">Tambah Item</p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <select value={stockItemDraft.nama} onChange={(e) => setStockItemDraft(prev => ({ ...prev, nama: e.target.value }))} className="col-span-2 w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm bg-white">
+                          {PRINTING_ITEM_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                        </select>
+                        <input type="number" min="1" value={stockItemDraft.jumlah} onChange={(e) => setStockItemDraft(prev => ({ ...prev, jumlah: e.target.value }))} placeholder="Jumlah" className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm" />
+                        <select value={stockItemDraft.satuan} onChange={(e) => setStockItemDraft(prev => ({ ...prev, satuan: e.target.value }))} className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm bg-white">
+                          <option value="Bag">Bag</option>
+                          <option value="Pcs">Pcs</option>
+                        </select>
+                      </div>
+                      <button type="button" onClick={addStockNoteItem} className="w-full bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-100 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5">
+                        <i data-lucide="plus" className="w-3.5 h-3.5"></i>
+                        <span>Tambah Item</span>
+                      </button>
+                    </div>
+
+                    {stockNoteItems.length > 0 && (
+                      <div className="divide-y divide-slate-100 border border-slate-100 rounded-xl overflow-hidden">
+                        {stockNoteItems.map(it => (
+                          <div key={it.id} className="flex items-center justify-between px-3 py-2.5">
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-slate-700 truncate">{it.nama}</p>
+                              <p className="text-xs text-slate-500">{it.jumlah} {it.satuan}</p>
+                            </div>
+                            <button onClick={() => removeStockNoteItem(it.id)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100 shrink-0">
+                              <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <button onClick={handleStockNotePrint} disabled={stockNoteItems.length === 0} className="w-full bg-purple-800 hover:bg-purple-900 disabled:opacity-50 text-white font-bold py-3 rounded-xl text-sm flex items-center justify-center gap-2">
+                      <i data-lucide="printer" className="w-4 h-4"></i>
+                      <span>Cetak Catatan Stok</span>
+                    </button>
+                  </div>
+                )}
+
+                {printingSubTab === 'history' && (() => {
+                  const filteredHistory = printHistory.filter(h => printHistoryFilter === 'all' ? true : h.type === printHistoryFilter);
+                  return (
+                    <div className="space-y-3">
+                      <div className="bg-purple-50 border border-purple-100 rounded-xl px-3 py-2.5 flex items-start gap-2">
+                        <i data-lucide="smartphone" className="w-3.5 h-3.5 text-purple-700 shrink-0 mt-0.5"></i>
+                        <p className="text-[11px] text-purple-800 leading-relaxed">Riwayat ini tersimpan <b>hanya di perangkat ini</b> (localStorage), tidak dikirim ke server. Kalau ganti HP/browser atau membersihkan data browser, riwayat ini akan hilang.</p>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex bg-slate-100 rounded-xl p-1 gap-1 flex-1">
+                          <button onClick={() => setPrintHistoryFilter('all')} className={`flex-1 text-[11px] font-bold py-1.5 rounded-lg transition-all ${printHistoryFilter === 'all' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>Semua</button>
+                          <button onClick={() => setPrintHistoryFilter('premix')} className={`flex-1 text-[11px] font-bold py-1.5 rounded-lg transition-all ${printHistoryFilter === 'premix' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>Premix</button>
+                          <button onClick={() => setPrintHistoryFilter('stock')} className={`flex-1 text-[11px] font-bold py-1.5 rounded-lg transition-all ${printHistoryFilter === 'stock' ? 'bg-white text-purple-800 shadow-sm' : 'text-slate-500'}`}>Catatan Stok</button>
+                        </div>
+                        {filteredHistory.length > 0 && (
+                          <button
+                            onClick={() => setConfirmClearHistoryType(printHistoryFilter)}
+                            className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-100 px-2.5 py-2 rounded-xl"
+                          >
+                            <i data-lucide="trash-2" className="w-3 h-3"></i>
+                            <span>Hapus Semua</span>
+                          </button>
+                        )}
+                      </div>
+
+                      {filteredHistory.length === 0 ? (
+                        <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center">
+                          <i data-lucide="inbox" className="w-8 h-8 text-slate-300 mx-auto mb-2"></i>
+                          <p className="text-xs text-slate-500">Belum ada riwayat cetak{printHistoryFilter !== 'all' ? (printHistoryFilter === 'premix' ? ' Premix' : ' Catatan Stok') : ''}.</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {filteredHistory.map(h => (
+                            <div key={h.id} className="bg-white rounded-2xl border border-slate-200 p-3.5">
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-1.5 mb-1">
+                                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-md ${h.type === 'premix' ? 'bg-wheat-100 text-wheat-600' : 'bg-brand-100 text-brand-700'}`}>
+                                      {h.type === 'premix' ? 'PREMIX' : 'CATATAN STOK'}
+                                    </span>
+                                    <span className="text-[10px] text-slate-400">
+                                      {new Date(h.savedAt).toLocaleString('id-ID', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                                    </span>
+                                  </div>
+                                  {h.type === 'premix' ? (
+                                    <div className="text-xs text-slate-600 space-y-0.5">
+                                      <p className="font-semibold text-slate-800 truncate">{h.data.namaBarang}</p>
+                                      <p className="truncate">Toko: {h.data.namaToko}</p>
+                                      <p className="truncate">Buat: {formatIndonesianDate(h.data.tanggalBuat)} &middot; Exp: {formatIndonesianDate(h.data.tanggalExp)}</p>
+                                      {h.data.asalBahan && <p className="truncate">Asal: {h.data.asalBahan}</p>}
+                                    </div>
+                                  ) : (
+                                    <div className="text-xs text-slate-600 space-y-0.5">
+                                      <p className="font-semibold text-slate-800 truncate">Toko: {h.data.namaToko}</p>
+                                      <p>{(h.data.items || []).length} item</p>
+                                      <p className="truncate text-slate-500">
+                                        {(h.data.items || []).map(it => `${it.nama} (${it.jumlah} ${it.satuan})`).join(', ')}
+                                      </p>
+                                    </div>
+                                  )}
+                                </div>
+                                <button onClick={() => setConfirmDeleteHistoryId(h.id)} className="shrink-0 text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100">
+                                  <i data-lucide="trash-2" className="w-3.5 h-3.5"></i>
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Konfirmasi hapus 1 entri riwayat cetak */}
+            {confirmDeleteHistoryId && (
+              <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+                <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                  <h3 className="font-bold text-slate-800 mb-2">Hapus Riwayat Ini?</h3>
+                  <p className="text-xs text-slate-500 mb-4">Entri riwayat cetak ini akan dihapus permanen dari perangkat ini dan tidak bisa dikembalikan.</p>
+                  <div className="flex gap-2">
+                    <button onClick={() => setConfirmDeleteHistoryId(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                    <button onClick={() => deletePrintHistoryItem(confirmDeleteHistoryId)} className="flex-1 bg-rose-600 text-white font-bold py-2.5 rounded-xl text-sm">Ya, Hapus</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Konfirmasi hapus semua riwayat cetak (sesuai filter yang aktif) */}
+            {confirmClearHistoryType && (
+              <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+                <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                  <h3 className="font-bold text-slate-800 mb-2">Hapus Semua Riwayat?</h3>
+                  <p className="text-xs text-slate-500 mb-4">
+                    {confirmClearHistoryType === 'all'
+                      ? 'Seluruh riwayat cetak (Premix & Catatan Stok) di perangkat ini akan dihapus permanen.'
+                      : `Seluruh riwayat cetak ${confirmClearHistoryType === 'premix' ? 'Premix' : 'Catatan Stok'} di perangkat ini akan dihapus permanen.`}
+                    {' '}Tindakan ini tidak bisa dibatalkan.
+                  </p>
+                  <div className="flex gap-2">
+                    <button onClick={() => setConfirmClearHistoryType(null)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                    <button onClick={() => clearPrintHistory(confirmClearHistoryType)} className="flex-1 bg-rose-600 text-white font-bold py-2.5 rounded-xl text-sm">Ya, Hapus</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Area cetak tersembunyi (hanya tampil saat dialog print browser terbuka, lihat CSS
+                #thermalPrintArea @media print di <style> global). Font monospace + layout
+                bertumpuk agar cocok baik dicetak di kertas thermal 58mm/80mm maupun kertas biasa. */}
+            <div id="thermalPrintArea">
+              {premixPrintData && (
+                <div style={{ fontFamily: "'Courier New', monospace", fontSize: '12px', width: '100%', color: '#000' }}>
+                  <div style={{ textAlign: 'center', fontWeight: 'bold', fontSize: '14px', marginBottom: '6px' }}>LABEL PREMIX</div>
+                  <div style={{ borderTop: '1px dashed #000', margin: '4px 0' }}></div>
+                  <div style={{ marginBottom: '3px' }}><b>Nama Toko:</b> {premixPrintData.namaToko}</div>
+                  <div style={{ marginBottom: '3px' }}><b>Nama Barang:</b> {premixPrintData.namaBarang}</div>
+                  <div style={{ marginBottom: '3px' }}><b>Tanggal Buat:</b> {formatIndonesianDate(premixPrintData.tanggalBuat)}</div>
+                  <div style={{ marginBottom: '3px' }}><b>Tanggal Exp:</b> {formatIndonesianDate(premixPrintData.tanggalExp)}</div>
+                  <div style={{ marginBottom: '3px' }}><b>Asal Bahan Produksi:</b> {premixPrintData.asalBahan || '-'}</div>
+                  <div style={{ borderTop: '1px dashed #000', margin: '4px 0' }}></div>
+                </div>
+              )}
+              {stockPrintData && (
+                <div style={{ fontFamily: "'Courier New', monospace", fontSize: '12px', width: '100%', color: '#000' }}>
+                  <div style={{ textAlign: 'center', fontWeight: 'bold', fontSize: '14px', marginBottom: '6px' }}>CATATAN STOK</div>
+                  <div style={{ borderTop: '1px dashed #000', margin: '4px 0' }}></div>
+                  <div style={{ marginBottom: '3px' }}><b>Nama Toko:</b> {stockPrintData.namaToko}</div>
+                  <div style={{ marginBottom: '3px' }}><b>Tanggal:</b> {stockPrintData.tanggalCetak.toLocaleString('id-ID', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</div>
+                  <div style={{ borderTop: '1px dashed #000', margin: '4px 0' }}></div>
+                  {stockPrintData.items.map((it, idx) => (
+                    <div key={it.id} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '3px' }}>
+                      <span>{idx + 1}. {it.nama}</span>
+                      <span>{it.jumlah} {it.satuan}</span>
+                    </div>
+                  ))}
+                  <div style={{ borderTop: '1px dashed #000', margin: '4px 0' }}></div>
+                </div>
+              )}
+            </div>
+
+            {/* Tab: History */}
+            {activeTab === 'history' && (
+              <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm space-y-6">
+                <div className="flex justify-between items-center pb-4 border-b border-slate-100">
+                  <div>
+                    <h3 className="font-bold text-slate-800 text-lg">Riwayat Data Cloud (Firebase)</h3>
+                    <p className="text-xs text-slate-500">Kelola riwayat input yang tersinkronisasi di semua HP karyawan.</p>
+                  </div>
+                  <button onClick={handleExportCSV} className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1 transition-all">
+                    <i data-lucide="download" className="w-3.5 h-3.5"></i>
+                    <span>Unduh CSV</span>
+                  </button>
+                </div>
+
+                {historyList.length === 0 ? (
+                  <div className="text-center py-12 text-slate-600">
+                    <i data-lucide="history" className="w-12 h-12 mx-auto mb-2 text-slate-600"></i>
+                    <p className="text-sm font-medium">Belum ada riwayat tersimpan di Cloud Firebase.</p>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-100">
+                    {historyList.map(item => (
+                      <div key={item.tanggal} className="py-4 flex justify-between items-center">
+                        <div>
+                          <h4 className="font-bold text-slate-700 text-sm">{formatIndonesianDate(item.tanggal)}</h4>
+                          <p className="text-xs text-slate-600">
+                            Roti Terjual: {item.totalSales} Pcs | Pendapatan: Rp {item.revenue.toLocaleString('id-ID')}
+                          </p>
+                        </div>
+                        <div className="flex items-center space-x-2">
+                          <button onClick={() => loadHistoryToActive(item)} className="bg-purple-50 text-purple-700 text-xs font-bold px-2.5 py-1.5 rounded-lg border border-purple-100">Buka</button>
+                          <button onClick={() => handleDeleteHistory(item.tanggal)} className="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg border border-rose-100"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Tab: Panduan SOP */}
+            {activeTab === 'sop' && (
+              <div className="space-y-4">
+                {!selectedSopCategory ? (
+                  <React.Fragment>
+                    <div>
+                      <h2 className="font-bold text-slate-700 text-base flex items-center gap-2">
+                        <i data-lucide="book-open" className="w-4 h-4 text-purple-700"></i>
+                        <span>Panduan SOP</span>
+                      </h2>
+                      <p className="text-xs text-slate-500 mt-1">Pilih kategori untuk melihat langkah-langkah SOP beserta foto/video pendukung.</p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <button
+                        onClick={() => setShowOnboarding(true)}
+                        className="flex-1 flex items-center justify-center gap-2 bg-purple-50 text-purple-700 border border-purple-100 text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-purple-100 transition-all"
+                      >
+                        <i data-lucide="compass" className="w-4 h-4"></i>
+                        <span>Mulai Tur Panduan Menu</span>
+                      </button>
+                      <button
+                        onClick={() => setShowMandatoryChecklist(true)}
+                        className="flex-1 flex items-center justify-center gap-2 bg-rose-50 text-rose-700 border border-rose-100 text-xs font-bold px-4 py-2.5 rounded-xl hover:bg-rose-100 transition-all"
+                      >
+                        <i data-lucide="alert-triangle" className="w-4 h-4"></i>
+                        <span>Lihat Hal yang Wajib Diingat</span>
+                      </button>
+                    </div>
+                    {sopCategories.length === 0 ? (
+                      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-10 text-center text-slate-600 text-sm">Belum ada Panduan SOP untuk toko ini.</div>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {sopCategories.map(cat => (
+                          <button key={cat.id} onClick={() => setSelectedSopCategory(cat)} className="text-left bg-white rounded-2xl border border-slate-200 shadow-sm p-4 hover:border-purple-300 hover:shadow-md transition-all">
+                            <div className="flex items-center justify-between">
+                              <div className="bg-purple-50 text-purple-700 p-2 rounded-lg">
+                                <i data-lucide="file-text" className="w-4 h-4"></i>
+                              </div>
+                              {cat.media.length > 0 && (
+                                <span className="text-[10px] bg-slate-100 text-slate-500 font-bold px-1.5 py-0.5 rounded-md flex items-center gap-1">
+                                  <i data-lucide="image" className="w-3 h-3"></i>{cat.media.length}
+                                </span>
+                              )}
+                            </div>
+                            <h3 className="font-bold text-slate-800 text-sm mt-2">{cat.name}</h3>
+                            {cat.content && <p className="text-xs text-slate-600 mt-1 line-clamp-2">{cat.content}</p>}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </React.Fragment>
+                ) : (
+                  <React.Fragment>
+                    <button onClick={() => setSelectedSopCategory(null)} className="flex items-center gap-1.5 text-purple-700 text-xs font-bold">
+                      <i data-lucide="arrow-left" className="w-3.5 h-3.5"></i>
+                      <span>Kembali ke Panduan SOP</span>
+                    </button>
+                    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4">
+                      <h2 className="font-bold text-slate-800 text-base">{selectedSopCategory.name}</h2>
+                      {selectedSopCategory.content ? (
+                        <p className="text-sm text-slate-600 mt-2 whitespace-pre-wrap">{selectedSopCategory.content}</p>
+                      ) : (
+                        <p className="text-xs text-slate-600 mt-2">Belum ada isi teks untuk SOP ini.</p>
+                      )}
+
+                      {selectedSopCategory.media.length > 0 && (
+                        <div className="mt-4 pt-4 border-t border-slate-100">
+                          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-2">Foto/Video Pendukung</p>
+                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                            {selectedSopCategory.media.map(m => (
+                              m.type === 'image' ? (
+                                <button key={m.id} onClick={() => setSopLightboxUrl(m.url)} className="aspect-square bg-slate-100 rounded-lg overflow-hidden">
+                                  <img src={m.url} alt={m.originalName || m.name} className="w-full h-full object-cover" />
+                                </button>
+                              ) : (
+                                <video key={m.id} src={m.url} controls className="aspect-square w-full bg-black rounded-lg object-cover"></video>
+                              )
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </React.Fragment>
+                )}
+
+                {/* Lightbox foto */}
+                {sopLightboxUrl && (
+                  <div className="fixed inset-0 z-[95] bg-black/80 flex items-center justify-center p-4 animate-fadeIn" onClick={() => setSopLightboxUrl(null)}>
+                    <img src={sopLightboxUrl} className="max-w-full max-h-full rounded-lg animate-scaleIn" />
+                    <button onClick={() => setSopLightboxUrl(null)} className="absolute top-4 right-4 bg-white/10 hover:bg-white/20 text-white rounded-full p-2">
+                      <i data-lucide="x" className="w-5 h-5"></i>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Tab: Chat dengan Admin */}
+            {activeTab === 'chat' && (
+              <ChatPanel storeId={storeId} senderRole="store" senderLabel={storeName} title="Chat dengan Admin" />
+            )}
+
+          </main>
+
+        </div>
+      );
+    }
+
+    // ==========================================
+    // KOMPONEN CHAT (dipakai oleh Toko & Admin)
+    // ==========================================
+    function ChatPanel({ storeId, senderRole, senderLabel, title, allowEndSession }) {
+      const [messages, setMessages] = useState([]);
+      const [text, setText] = useState('');
+      const [sending, setSending] = useState(false);
+      const [confirmEnd, setConfirmEnd] = useState(false);
+      const [ending, setEnding] = useState(false);
+      const bottomRef = React.useRef(null);
+
+      // REAL-TIME (2026-07-20, sebelumnya poll tiap 15 detik lewat GET /api/chat penuh):
+      // sekarang riwayat pesan cuma diambil PENUH sekali di awal (buka chat), setelah itu
+      // pesan BARU datang lewat long-poll /api/chat/wait yang langsung "dibangunkan" server
+      // detik itu juga saat lawan bicara kirim pesan — jadi terasa instan tanpa WebSocket.
+      useEffect(() => {
+        let stopped = false;
+
+        (async () => {
+          try {
+            const res = await __apiFetch(`${WORKER_BASE}/api/chat?storeId=${encodeURIComponent(storeId)}&limit=200`, { headers: __authHeaders() });
+            const data = await res.json();
+            if (!stopped && data.messages) setMessages(data.messages);
+          } catch (e) { /* riwayat gagal dimuat, tapi long-poll di bawah tetap coba jalan */ }
+        })();
+
+        const poller = createChatLongPoll({
+          storeId,
+          onChange: (data) => {
+            if (stopped || !data.event) return;
+            setMessages(prev => {
+              // Cegah dobel: kalau ini pesan yang kita kirim sendiri (sudah dimasukkan
+              // secara optimistic oleh handleSend), atau memang sudah ada dari poll lain.
+              if (prev.some(m => m.id === data.event.id)) return prev;
+              return [...prev, data.event].sort((a, b) => a.timestamp - b.timestamp);
+            });
+          },
+        });
+        return () => { stopped = true; poller.stop(); };
+      }, [storeId]);
+
+      // Tandai terbaca di server (bukan cuma localStorage) begitu panel chat ini dibuka,
+      // supaya badge unread akurat lintas device juga.
+      useEffect(() => {
+        __apiFetch(`${WORKER_BASE}/api/chat/mark-read`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+          body: JSON.stringify({ storeId }),
+        }).catch(() => {});
+      }, [storeId, messages.length]);
+
+      useEffect(() => {
+        if (bottomRef.current) bottomRef.current.scrollIntoView({ behavior: 'smooth' });
+      }, [messages.length]);
+
+      const handleSend = async (e) => {
+        e.preventDefault();
+        const trimmed = text.trim().slice(0, 1000); // batasi panjang pesan (anti abuse)
+        if (!trimmed) return;
+        setSending(true);
+        const optimisticMsg = { sender: senderRole, senderLabel, text: trimmed, timestamp: Date.now() };
+        try {
+          const res = await __apiFetch(`${WORKER_BASE}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ storeId, senderLabel, text: trimmed }),
+          });
+          const result = await res.json();
+          // Langsung tampilkan pesan di layar SEKETIKA (tidak nunggu poll berikutnya),
+          // supaya tidak terasa lambat untuk melihat pesan sendiri.
+          const newId = (result && result.id) ? result.id : ('local-' + optimisticMsg.timestamp);
+          setMessages(prev => [...prev, { id: newId, ...optimisticMsg }].sort((a, b) => a.timestamp - b.timestamp));
+          setText('');
+        } catch (err) {
+          console.error(err);
+        } finally {
+          setSending(false);
+        }
+      };
+
+      // Admin dapat mengakhiri sesi chat: seluruh riwayat pesan dengan toko ini dihapus permanen,
+      // dan percakapan otomatis mulai dari kosong lagi (baik di sisi admin maupun toko).
+      const handleEndSession = async () => {
+        setEnding(true);
+        try {
+          await __apiFetch(`${WORKER_BASE}/api/chat/end-session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...__authHeaders() },
+            body: JSON.stringify({ storeId }),
+          });
+          setMessages([]);
+          setConfirmEnd(false);
+        } catch (err) {
+          console.error(err);
+        } finally {
+          setEnding(false);
+        }
+      };
+
+      return (
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col h-[70vh] max-h-[600px]">
+          <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <i data-lucide="message-circle" className="w-4 h-4 text-purple-700 shrink-0"></i>
+              <h3 className="font-bold text-slate-800 text-sm truncate">{title}</h3>
+            </div>
+            {allowEndSession && messages.length > 0 && (
+              <button onClick={() => setConfirmEnd(true)} className="shrink-0 flex items-center gap-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-100 px-2 py-1.5 rounded-lg">
+                <i data-lucide="rotate-ccw" className="w-3 h-3"></i> Akhiri Sesi
+              </button>
+            )}
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {messages.length === 0 && (
+              <p className="text-xs text-slate-600 text-center py-8">Belum ada pesan. Mulai percakapan di bawah ini.</p>
+            )}
+            {messages.map(m => (
+              <div key={m.id} className={`flex ${m.sender === senderRole ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[75%] rounded-2xl px-3 py-2 text-xs ${m.sender === senderRole ? 'bg-purple-700 text-white rounded-br-sm' : 'bg-slate-100 text-slate-700 rounded-bl-sm'}`}>
+                  {m.sender !== senderRole && <p className="text-[10px] font-bold opacity-70 mb-0.5">{m.senderLabel}</p>}
+                  <p className="whitespace-pre-wrap break-words">{m.text}</p>
+                  <p className={`text-[9px] mt-1 ${m.sender === senderRole ? 'text-purple-200' : 'text-slate-600'}`}>
+                    {new Date(m.timestamp).toLocaleString('id-ID', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                  </p>
+                </div>
+              </div>
+            ))}
+            <div ref={bottomRef}></div>
+          </div>
+          <form onSubmit={handleSend} className="p-3 border-t border-slate-100 flex items-center gap-2">
+            <input
+              type="text"
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              maxLength={1000}
+              placeholder="Tulis pesan..."
+              className="flex-1 px-3 py-2 border border-slate-300 rounded-xl text-sm min-w-0"
+            />
+            <button type="submit" disabled={sending || !text.trim()} className="bg-purple-800 disabled:opacity-50 text-white p-2.5 rounded-xl shrink-0">
+              <i data-lucide="send" className="w-4 h-4"></i>
+            </button>
+          </form>
+
+          {confirmEnd && (
+            <div className="fixed inset-0 z-[95] bg-black/50 flex items-center justify-center p-4 animate-fadeIn">
+              <div className="bg-white rounded-2xl animate-scaleIn w-full max-w-sm p-6">
+                <h3 className="font-bold text-slate-800 mb-2">Akhiri Sesi Chat?</h3>
+                <p className="text-xs text-slate-500 mb-4">Seluruh riwayat pesan pada percakapan ini akan <b>dihapus permanen</b> dan tidak bisa dikembalikan. Percakapan akan mulai dari awal lagi.</p>
+                <div className="flex gap-2">
+                  <button onClick={() => setConfirmEnd(false)} className="flex-1 bg-slate-100 text-slate-600 font-bold py-2.5 rounded-xl text-sm">Batal</button>
+                  <button onClick={handleEndSession} disabled={ending} className="flex-1 bg-rose-600 disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-sm">{ending ? 'Menghapus...' : 'Ya, Akhiri'}</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ==========================================
+    // ERROR BOUNDARY GLOBAL — MENCEGAH LAYAR PUTIH
+    // ==========================================
+    // Sebelumnya, jika terjadi error tak terduga di mana pun dalam aplikasi (misalnya saat
+    // menyimpan data lalu me-render ulang Riwayat), React akan "meruntuhkan" seluruh halaman
+    // dan layar menjadi putih kosong tanpa keterangan apa pun — pengguna harus refresh manual
+    // dan kadang khawatir datanya hilang. ErrorBoundary ini menangkap error tersebut, MENCEGAH
+    // layar putih, dan menampilkan pesan yang jelas + tombol "Muat Ulang". Data yang sudah
+    // tersimpan ke Cloud (Firebase) TIDAK hilang walau tampilan sempat error, karena proses
+    // simpan data terjadi sebelum render ulang tampilan.
+    class AppErrorBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { hasError: false, errorInfo: '' };
+      }
+      static getDerivedStateFromError(error) {
+        return { hasError: true, errorInfo: (error && error.message) ? error.message : String(error) };
+      }
+      componentDidCatch(error, info) {
+        console.error('Tarobun App Error (ditangkap ErrorBoundary):', error, info);
+      }
+      handleReload = () => {
+        this.setState({ hasError: false, errorInfo: '' });
+        window.location.reload();
+      };
+      render() {
+        if (this.state.hasError) {
+          return (
+            <div className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 max-w-sm w-full text-center space-y-3">
+                <div className="w-14 h-14 rounded-full bg-rose-50 flex items-center justify-center mx-auto">
+                  <i data-lucide="alert-triangle" className="w-7 h-7 text-rose-500"></i>
+                </div>
+                <h2 className="font-bold text-slate-800 text-lg">Ups, terjadi kendala tampilan</h2>
+                <p className="text-xs text-slate-500">
+                  Jangan khawatir, data yang sudah tersimpan ke Cloud tetap aman. Silakan muat ulang halaman untuk melanjutkan.
+                </p>
+                <button
+                  onClick={this.handleReload}
+                  className="w-full bg-purple-800 hover:bg-purple-900 text-white font-bold py-2.5 rounded-xl text-sm"
+                >
+                  Muat Ulang Halaman
+                </button>
+              </div>
+            </div>
+          );
+        }
+        return this.props.children;
+      }
+    }
+
+    // Tangkap juga error async (Promise) yang tidak ter-handle supaya tidak diam-diam
+    // membuat sebagian fitur berhenti bekerja tanpa keterangan ke pengguna.
+    window.addEventListener('unhandledrejection', (event) => {
+      console.error('Tarobun App - Promise ditolak tanpa ditangani:', event.reason);
+    });
+
+    // Diekspor sebagai komponen App biasa -- pemanggilan ReactDOM.createRoot/render
+    // sekarang jadi tanggung jawab src/main.jsx (satu-satunya entry point Vite),
+    // bukan dilakukan di sini lagi.
+    export default function App() {
+      return <AppErrorBoundary><AppRoot /></AppErrorBoundary>;
+    }
