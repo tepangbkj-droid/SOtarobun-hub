@@ -1,41 +1,52 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-// Catatan jujur soal "obfuscation": Vite/Terser MEMINIFY (menghapus komentar/spasi,
-// memendekkan nama variabel lokal) — ini membuat kode tidak nyaman dibaca manusia dan
-// mengecilkan ukuran file, tapi ini BUKAN enkripsi. Siapa pun yang cukup gigih tetap bisa
-// membaca JS hasil minifikasi (di-"prettify" lalu dibaca pelan-pelan). Untuk aplikasi
-// internal, ini sudah standar & memadai; keamanan SUNGGUHAN tetap harus ada di server
-// (lihat worker/index.js — RBAC & validasi ulang di sana, bukan di sini).
+// ==========================================================================
+// PILAR KEAMANAN #1 — MINIFIKASI / OBFUSCATION AGRESIF
+// Vite secara default sudah minify pakai esbuild (cepat, tapi ringan).
+// Di sini kita paksa pakai Terser dengan opsi paling agresif: nama variabel
+// di-mangle habis (termasuk top-level & properti aman), semua console.*,
+// debugger, dan komentar dibuang dari bundle produksi. Ini BUKAN enkripsi
+// sungguhan (JS yang jalan di browser selalu bisa dibaca ulang oleh yang
+// niat), tapi jauh lebih sulit dibaca/ditelusuri dibanding source asli.
+// ==========================================================================
 export default defineConfig({
   plugins: [react()],
   build: {
-    outDir: 'dist',
-    sourcemap: false, // jangan publikasikan source map di build produksi
+    target: 'es2018',
     minify: 'terser',
+    sourcemap: false,
+    cssMinify: true,
     terserOptions: {
       compress: {
-        drop_console: true, // buang semua console.log/warn/error dari build produksi
+        drop_console: true,
         drop_debugger: true,
-        passes: 2,
+        passes: 3,
+        pure_funcs: ['console.log', 'console.info', 'console.debug'],
       },
       mangle: {
-        toplevel: true, // pendekkan nama variabel/fungsi top-level juga
+        toplevel: true,
+        safari10: true,
       },
       format: {
-        comments: false, // buang semua komentar (termasuk komentar berisi catatan internal)
+        comments: false,
       },
     },
     rollupOptions: {
       output: {
-        // Pecah vendor besar (react, lucide-react) ke chunk terpisah supaya cache
-        // browser lebih efisien saat hanya kode aplikasi yang berubah.
+        // Nama file chunk/asset diacak (hash), bukan nama fungsi/komponen asli,
+        // supaya struktur kode tidak mudah ditebak dari nama file di Network tab.
+        entryFileNames: 'assets/[hash].js',
+        chunkFileNames: 'assets/[hash].js',
+        assetFileNames: 'assets/[hash][extname]',
         manualChunks: {
           vendor: ['react', 'react-dom'],
-          icons: ['lucide-react'],
         },
       },
     },
-    chunkSizeWarningLimit: 1000,
+  },
+  server: {
+    // Hanya untuk `npm run dev` lokal; tidak berlaku di build produksi.
+    port: 5173,
   },
 });

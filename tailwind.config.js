@@ -31,9 +31,7 @@ export default {
         softHover: '0 4px 14px -2px rgba(30, 27, 46, 0.08), 0 16px 32px -12px rgba(30, 27, 46, 0.16)',
       },
       keyframes: {
-        shimmer: {
-          '100%': { transform: 'translateX(100%)' },
-        },
+        shimmer: { '100%': { transform: 'translateX(100%)' } },
       },
       animation: {
         shimmer: 'shimmer 1.6s ease-in-out infinite',

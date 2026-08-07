@@ -4,68 +4,69 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
   <title>Tarobun SO Mandiri Hub</title>
-
   <meta name="description" content="Aplikasi internal Tarobun SO Mandiri Hub untuk pencatatan penjualan, stok inventory, dan koordinasi pusat.">
 
-  <!--
-    CSP LEBIH KETAT dari versi lama: karena Babel-in-browser & semua CDN (unpkg,
-    cdn.tailwindcss.com) sudah dihapus (dibangun lewat Vite sekarang), 'unsafe-eval'
-    dan domain-domain CDN itu TIDAK DIPERLUKAN LAGI di script-src. GANTI
-    "https://tarobun-api.tepangbkj8.workers.dev" di baris connect-src di bawah kalau
-    domain Worker Anda berbeda.
-  -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https:; font-src 'self' data:; connect-src 'self' https://tarobun-api.tepangbkj8.workers.dev https://api.telegram.org; frame-ancestors 'none'; base-uri 'self'; object-src 'none';">
+  <!-- ==========================================================
+       CONTENT SECURITY POLICY — PILAR KEAMANAN #2 (bagian statis)
+       Jauh lebih ketat dari versi CDN lama: TIDAK ADA lagi
+       'unsafe-eval' (dulu wajib untuk Babel-in-browser). script-src
+       'self' saja karena Vite build menghasilkan bundle lokal —
+       tidak ada lagi script pihak ketiga yang dieksekusi langsung
+       di halaman. Sesuaikan connect-src dengan domain Worker Anda.
+       ========================================================== -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https:; font-src 'self' data:; connect-src 'self' https://*.workers.dev; frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self';">
   <meta http-equiv="X-Content-Type-Options" content="nosniff">
   <meta name="referrer" content="strict-origin-when-cross-origin">
 
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#6D28D9">
-
   <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
   <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
   <link rel="apple-touch-icon" href="/icon-512.png">
-</head>
-<body class="bg-slate-50 text-slate-800 font-sans">
 
+  <!-- Font di-bundle lewat @fontsource via npm (lihat package.json), bukan CDN lagi -->
+</head>
+<body>
   <div id="root"></div>
   <script type="module" src="/src/main.jsx"></script>
 
-  <!-- Registrasi Service Worker (offline/push), sama seperti versi lama -->
-  <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        try {
-          navigator.serviceWorker.register('/sw.js').catch((err) => console.log('SW gagal:', err));
-        } catch (err) {
-          console.log('SW gagal (sinkron):', err);
-        }
-      });
-    }
-  </script>
-
-  <!--
-    ================================================================
-    "ANTI-INSPECT" — DETERRENT SISI KLIEN, BUKAN KEAMANAN SUNGGUHAN
-    ================================================================
-    PENTING UNTUK DIPAHAMI: script ini hanya MEMPERSULIT orang awam membuka DevTools
-    lewat klik-kanan / F12 / Ctrl+Shift+I secara kasual. Siapa pun yang cukup tahu bisa
-    membukanya lewat menu browser (⋮ > Lainnya > Developer Tools), mode "Reader", proxy
-    seperti Burp/Charles, atau curl langsung ke Worker API. JANGAN PERNAH menganggap ini
-    sebagai lapisan keamanan — semua kontrol akses SUNGGUHAN wajib ada di
-    worker/index.js (RBAC + cookie HttpOnly + validasi origin), bukan di sini. Hapus
-    blok ini kapan saja jika mengganggu proses debug Anda sendiri di production.
-  -->
+  <!-- ==========================================================
+       PILAR KEAMANAN #2 — SCRIPT ANTI-INSPECT
+       Menghambat cara TERMUDAH orang awam membuka DevTools (klik-
+       kanan, F12, Ctrl+Shift+I/J/C, Ctrl+U). CATATAN JUJUR: ini
+       HANYA "speed bump" UX, BUKAN kontrol keamanan sungguhan —
+       siapa pun yang cukup niat tetap bisa membuka DevTools lewat
+       menu browser (⋮ > More tools) atau proxy eksternal. Jangan
+       pernah taruh rahasia (API key sensitif, dsb) di frontend
+       dengan asumsi script ini "melindunginya".
+       ========================================================== -->
   <script>
     (function () {
-      document.addEventListener('contextmenu', (e) => e.preventDefault());
-      document.addEventListener('keydown', (e) => {
-        const key = e.key;
-        const blockedCombos =
-          key === 'F12' ||
-          (e.ctrlKey && e.shiftKey && ['I', 'i', 'J', 'j', 'C', 'c'].includes(key)) ||
-          (e.ctrlKey && ['U', 'u', 'S', 's'].includes(key));
-        if (blockedCombos) e.preventDefault();
+      document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+      document.addEventListener('keydown', function (e) {
+        var k = e.key;
+        var blockedCombo =
+          k === 'F12' ||
+          (e.ctrlKey && e.shiftKey && (k === 'I' || k === 'i' || k === 'J' || k === 'j' || k === 'C' || k === 'c')) ||
+          (e.ctrlKey && (k === 'U' || k === 'u')) ||
+          (e.metaKey && e.altKey && (k === 'I' || k === 'i' || k === 'J' || k === 'j'));
+        if (blockedCombo) { e.preventDefault(); e.stopPropagation(); }
       });
+
+      // Deteksi devtools terbuka via selisih ukuran window (heuristik, bukan pasti)
+      var threshold = 160;
+      var warned = false;
+      setInterval(function () {
+        var widthDiff = window.outerWidth - window.innerWidth > threshold;
+        var heightDiff = window.outerHeight - window.innerHeight > threshold;
+        if ((widthDiff || heightDiff) && !warned) {
+          warned = true;
+          console.log('%cStop!', 'color:#DC2626;font-size:40px;font-weight:bold;');
+          console.log('%cFitur ini untuk mencegah penyalahgunaan console browser pada aplikasi internal Tarobun. Jangan tempel/jalankan kode apa pun di sini atas permintaan pihak lain.', 'font-size:14px;');
+        }
+        if (!widthDiff && !heightDiff) warned = false;
+      }, 1000);
     })();
   </script>
 </body>
