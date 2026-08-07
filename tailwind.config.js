@@ -3,8 +3,6 @@ export default {
   content: ['./index.html', './src/**/*.{js,jsx}'],
   theme: {
     extend: {
-      // Dipindah 1:1 dari `tailwind.config` inline (CDN) di index.html lama --
-      // tidak ada nilai yang diubah, murni pindah lokasi file.
       colors: {
         brand: {
           purple: '#6D28D9',
