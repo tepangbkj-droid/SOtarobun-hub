@@ -1,0 +1,208 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ========================================================================
+   Di bawah ini dipindah APA ADANYA dari <style> inline di index.html lama
+   (tidak ada perubahan logika/nilai, murni pindah lokasi file).
+   ======================================================================== */
+
+    /* ========================================== */
+    /* PENGAMAN RESPONSIF GLOBAL (2026-07-22) */
+    /* Mencegah layar "kepotong"/geser horizontal di HP dengan lebar layar kecil
+       (mis. 320-360px) — biasanya disebabkan 1 elemen saja yang lebih lebar dari
+       layar (teks panjang tanpa wrap, gambar tanpa max-width, dsb) yang memaksa
+       SELURUH halaman jadi bisa di-scroll ke samping. */
+    html, body { max-width: 100%; overflow-x: hidden; }
+    /* Teks panjang tanpa spasi (mis. link, isi pesanan PO, catatan BAP) dipaksa
+       pindah baris alih-alih mendorong lebar layout melebar ke samping. */
+    * { overflow-wrap: break-word; word-break: break-word; }
+    img, video { max-width: 100%; height: auto; }
+
+    @keyframes tarobunFadeIn { from { opacity: 0 } to { opacity: 1 } }
+    @keyframes tarobunScaleIn { from { opacity: 0; transform: scale(0.9) } to { opacity: 1; transform: scale(1) } }
+    .animate-fadeIn { animation: tarobunFadeIn 0.2s ease-out; }
+    .animate-scaleIn { animation: tarobunScaleIn 0.25s cubic-bezier(0.34, 1.56, 0.64, 1); }
+
+    /* ========================================== */
+    /* CETAK THERMAL (Fitur Printing: Premix & Catatan Stok) */
+    /* ========================================== */
+    /* Area cetak disembunyikan di layar (hanya dipakai saat dialog print browser
+       terbuka). Trik "sembunyikan semua, tampilkan area cetak saja" ini bekerja di
+       SEMUA jenis printer (biasa/laser/inkjet/A4) MAUPUN printer thermal (58mm/80mm)
+       karena tidak menetapkan lebar kertas fisik (mm) secara paksa — ukuran kertas
+       & margin diserahkan ke driver/printer masing-masing lewat "size: auto". Layout
+       memakai font monospace + elemen bertumpuk (bukan tabel lebar tetap) supaya tetap
+       rapi baik di kertas sempit 58mm maupun kertas lebar A4/Letter. */
+    #thermalPrintArea { display: none; }
+    @media print {
+      body * { visibility: hidden !important; }
+      #thermalPrintArea, #thermalPrintArea * { visibility: visible !important; }
+      #thermalPrintArea {
+        display: block !important;
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+      }
+      @page { size: auto; margin: 3mm; }
+    }
+
+    /* ========================================== */
+    /* SPLASH SCREEN (animasi masuk saat app dibuka) */
+    /* ========================================== */
+    @keyframes tarobunSplashLogoIn {
+      0%   { opacity: 0; transform: scale(0.72); }
+      60%  { opacity: 1; transform: scale(1.05); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+    @keyframes tarobunSplashTextIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes tarobunSplashOut {
+      from { opacity: 1; }
+      to   { opacity: 0; }
+    }
+    .tarobun-splash {
+      animation: tarobunSplashOut 0.45s ease-in forwards;
+      animation-delay: 1.35s;
+    }
+    .tarobun-splash-logo {
+      animation: tarobunSplashLogoIn 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+    .tarobun-splash-text {
+      animation: tarobunSplashTextIn 0.5s ease-out both;
+      animation-delay: 0.35s;
+    }
+
+    /* ========================================== */
+    /* INDIKATOR STATUS ONLINE (dot berkedip lembut) */
+    /* ========================================== */
+    /* Sengaja dibuat sendiri (bukan pakai utility animate-ping bawaan Tailwind yang default-nya
+       1 detik & agak "kasar") supaya ritmenya lebih perlahan & lembut — durasi 2.2 detik,
+       ripple melebar sambil memudar, mengulang terus selama toko online. */
+    @keyframes tarobunPresencePing {
+      0%   { transform: scale(1);   opacity: 0.55; }
+      70%  { transform: scale(2.3); opacity: 0; }
+      100% { transform: scale(2.3); opacity: 0; }
+    }
+    .presence-dot-ping {
+      animation: tarobunPresencePing 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+
+    /* ========================================== */
+    /* TOUR GUIDE INTERAKTIF (spotlight highlight menu SOP onboarding) */
+    /* ========================================== */
+    /* Kotak spotlight: memakai trik box-shadow raksasa (0 0 0 9999px) supaya seluruh layar
+       jadi gelap KECUALI area menu yang sedang disorot — ringan (1 elemen, murni CSS,
+       tanpa canvas/svg/library) dan otomatis mengikuti ukuran/posisi elemen target. */
+    .tour-spotlight-box {
+      position: fixed;
+      z-index: 100;
+      border-radius: 14px;
+      box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.72), 0 0 0 3px #7C3AED, 0 0 18px 2px rgba(124,58,237,0.55);
+      pointer-events: none;
+      transition: top 0.28s cubic-bezier(0.4,0,0.2,1), left 0.28s cubic-bezier(0.4,0,0.2,1),
+                  width 0.28s cubic-bezier(0.4,0,0.2,1), height 0.28s cubic-bezier(0.4,0,0.2,1);
+    }
+    .tour-tooltip-card {
+      position: fixed;
+      z-index: 101;
+      max-width: 280px;
+      width: 84vw;
+      transition: top 0.28s cubic-bezier(0.4,0,0.2,1), left 0.28s cubic-bezier(0.4,0,0.2,1);
+    }
+    .tour-click-shield {
+      position: fixed;
+      inset: 0;
+      z-index: 99;
+      background: transparent;
+    }
+    @keyframes tourPulseDot {
+      0%, 100% { opacity: 1; } 50% { opacity: 0.35; }
+    }
+    .tour-pulse-dot { animation: tourPulseDot 1.4s ease-in-out infinite; }
+
+    /* ========================================== */
+    /* TIPOGRAFI DASAR & LAYOUT LEGA (dashboard modern) */
+    /* ========================================== */
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      line-height: 1.55;
+      letter-spacing: -0.006em;
+      /* Anti-aliasing lebih halus di layar retina/HiDPI, teks kecil dashboard jadi lebih nyaman dibaca */
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    h1, h2, h3 { letter-spacing: -0.015em; }
+
+    /* Scrollbar tipis & senada tema (bukan scrollbar default OS yang tebal/kontras) */
+    * { scrollbar-width: thin; scrollbar-color: #C4B5FD transparent; }
+    *::-webkit-scrollbar { width: 8px; height: 8px; }
+    *::-webkit-scrollbar-track { background: transparent; }
+    *::-webkit-scrollbar-thumb { background-color: #C4B5FD; border-radius: 999px; }
+    *::-webkit-scrollbar-thumb:hover { background-color: #A78BFA; }
+
+    /* Warna seleksi teks disesuaikan brand, bukan biru default browser */
+    ::selection { background-color: #DDD6FE; color: #3B1370; }
+
+    /* Focus ring konsisten & jelas terlihat (aksesibilitas keyboard) tanpa outline kotak default
+       yang kaku — dipakai otomatis di semua elemen interaktif. */
+    button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+      outline: 2px solid #7C3AED;
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+
+    /* Micro-interaction global: semua tombol & kartu bertransisi halus saat di-hover/ditekan,
+       tanpa perlu menambahkan className transition di ribuan tempat satu-satu. Efek "tekan"
+       (scale-down tipis) memberi rasa tombol benar-benar merespons sentuhan, terutama di HP. */
+    button, a { transition: transform 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease, opacity 0.15s ease, filter 0.15s ease; }
+    button:active:not(:disabled) { transform: scale(0.97); }
+    button:disabled { cursor: not-allowed; }
+
+    /* Kartu (rounded-xl/rounded-2xl + border, pola yang dipakai konsisten di seluruh app ini)
+       otomatis "terangkat" lembut saat disentuh kursor — memberi kesan permukaan yang hidup. */
+    .rounded-xl.border, .rounded-2xl.border {
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    }
+    .rounded-xl.border:hover, .rounded-2xl.border:hover {
+      box-shadow: 0 4px 14px -2px rgba(30, 27, 46, 0.08), 0 16px 32px -12px rgba(30, 27, 46, 0.16);
+    }
+
+    /* Hormati preferensi pengguna yang mematikan animasi (aksesibilitas) — semua animasi custom
+       di atas otomatis dinonaktifkan, bukan cuma yang bawaan Tailwind. */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+    }
+
+    /* ========================================== */
+    /* SKELETON LOADING (pengganti teks "Memuat...") */
+    /* ========================================== */
+    .skeleton {
+      position: relative;
+      overflow: hidden;
+      background-color: #E9E5FB; /* violet-50/100-ish, senada brand, bukan abu-abu generik */
+      border-radius: 8px;
+    }
+    .skeleton::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      transform: translateX(-100%);
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent);
+      animation: tarobunShimmer 1.6s ease-in-out infinite;
+    }
+    @keyframes tarobunShimmer { 100% { transform: translateX(100%); } }
+
+    /* Panel sidebar (menu hamburger Admin & Toko) masuk dari kiri dengan halus, bukan muncul tiba-tiba */
+    @keyframes tarobunSlideInLeft {
+      from { transform: translateX(-100%); }
+      to   { transform: translateX(0); }
+    }
+    .animate-slideInLeft { animation: tarobunSlideInLeft 0.28s cubic-bezier(0.16, 1, 0.3, 1); }
