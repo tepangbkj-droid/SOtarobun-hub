@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+  <title>Tarobun SO Mandiri Hub</title>
+  <meta name="description" content="Aplikasi internal Tarobun SO Mandiri Hub untuk pencatatan penjualan, stok inventory, dan koordinasi pusat.">
+
+  <!-- KEAMANAN: CSP diperketat -- CDN eksternal (unpkg, cdn.tailwindcss.com) tidak lagi
+       dipakai sama sekali sejak migrasi ke Vite, jadi tidak perlu di-whitelist lagi.
+       'unsafe-eval' juga sudah bisa dihapus di build produksi (dulu dibutuhkan Babel
+       Standalone yang mentransform JSX di browser -- sekarang transform terjadi saat
+       build, bukan runtime). connect-src tetap mengizinkan domain Worker API kamu. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: https:; font-src 'self' data:; connect-src 'self' https://*.workers.dev https://api.tarobun-hub.com https://api.telegram.org; frame-ancestors 'none'; base-uri 'self'; object-src 'none';">
+  <meta http-equiv="X-Content-Type-Options" content="nosniff">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#6D28D9">
+  <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+  <link rel="apple-touch-icon" href="/icon-512.png">
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans">
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
